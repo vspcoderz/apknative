@@ -1,69 +1,16 @@
-# Jetpack Compose support
+# Rust build output
+/target/
 
-## Goal
+# Generated test fixtures (rebuilt by testdata/run_tests.sh)
+/testdata/build/
 
-Render a Compose app's UI, not just its Activity lifecycle. Today
-`setContent` is answered with a no-op, so an app finishes `onResume` and
-exits having produced nothing on screen.
+# Local scratch
+*.apk
+*.dex
+*.dis
 
-## Why this is the shape of the problem
+# Local build driver -- points at a personal VPS, not part of the project
+/vps.sh
 
-A composable's body is ordinary bytecode — it already executes. What is
-missing is the machinery it writes *into*:
-
-- The compiler rewrites every `@Composable` call into emissions against a
-  `Composer`: `startRestartGroup` / `endRestartGroup`, `startNode` /
-  `endNode`, `rememberedValue`, `changed`, `consumeTextNodeFactory`, ...
-- The `Composer` is what turns those emissions into a tree of `LayoutNode`s.
-- That tree is what a `MeasurePolicy`/`LayoutNode` draws through a graphics
-  backend.
-
-So the work is a `Composer` implementation, then a render backend. Not
-"implement Compose" in the abstract — a specific, nameable missing class.
-
-## Stages
-
-### Stage 1 — make composables actually run
-`setContent` stops being a no-op. Extract the `Function2` content lambda
-from the call arguments and invoke it against a real `Composer` object.
-Any Composer method we have not implemented answers with an inert value so
-the composable runs to completion instead of dying on a missing method.
-
-Success: a Compose `Activity` composes its content headlessly. Measurable
-by instruction count and by the set of unresolved Composer methods, which
-tells us the actual surface area rather than guessing at it.
-
-### Stage 2 — a recording Composer
-Implement the group/node protocol so the emitted tree can be captured:
-`startNode`/`endNode` for structure, `consume*NodeFactory` for leaves.
-Dump the result as a text tree. This proves the app produced a real view
-hierarchy before any graphics exist.
-
-Success: `apknative ui app.apk` prints the composable tree with node
-types and content.
-
-### Stage 3 — measure and layout
-Give nodes a size, run measure/layout passes, resolve placement and
-intrinsic measurement. Still text-only output.
-
-### Stage 4 — draw
-Rasterise. Skia is the Android native renderer; on this machine there is
-no Vulkan and only `llvmpipe`, so this would be software-rendered and
-slow even when correct.
-
-## Constraints to keep in mind
-
-- No Vulkan on this host — software rendering only. Affects Stage 4.
-- Release APKs are R8-obfuscated, so Composer internals appear under
-  mangled names in a real APK; matching is on signature, not name.
-- Every stage must keep `./vps.sh ci` green. No stage may regress the
-  existing APK-launch and JVM-parity suites.
-
-## Verification
-
-- `./vps.sh ci` — build, JVM parity, APK launch
-- `apknative verify` clean on the F-Droid DEX files
-- F-Droid instruction count and missing-shim set, tracked as the
-  Stage 1 signal
 # Scratch planning doc for the current piece of work
 /PLAN.md
