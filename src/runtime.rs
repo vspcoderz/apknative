@@ -336,7 +336,11 @@ pub fn run_activity(&mut self, class_name: &str) -> Result<(), String> {
         }
     }
 
-    match self.lookup(self.cur, type_idx, "onCreate", None) {
+    // Android drives an Activity through a fixed lifecycle. onCreate is the
+    // only one with a body we can execute; the rest are stubbed overrides, but
+    // calling them keeps the app's own onStart/onResume logic running.
+    for phase in ["onCreate", "onStart", "onResume"] {
+        match self.lookup(self.cur, type_idx, phase, None) {
         Some((d, enc, m)) if enc.code_off != 0 => {
             let params = self
                 .d()
@@ -347,7 +351,8 @@ pub fn run_activity(&mut self, class_name: &str) -> Result<(), String> {
             args[0] = Value::Ref(obj);
             self.exec(d, m, args, 0)?;
         }
-        _ => println!("(class declares no onCreate(Bundle) with a body)"),
+        _ => {}
+        }
     }
     self.cur = saved;
     println!("--- end ---");
@@ -623,13 +628,17 @@ pub fn has_class(&self, name: &str) -> bool {
 
         // Convenience accessors. `unit` is the current 16-bit code unit.
         macro_rules! reg {
+            // Out-of-range indices degrade to Void instead of aborting; a
+            // desynchronised stream should not take the whole process down.
             ($i:expr) => {
-                regs[$i].clone()
+                regs.get($i).cloned().unwrap_or(Value::Void)
             };
         }
         macro_rules! setreg {
             ($i:expr, $v:expr) => {
-                regs[$i] = $v
+                if $i < regs.len() {
+                    regs[$i] = $v
+                }
             };
         }
 
@@ -770,10 +779,27 @@ pub fn has_class(&self, name: &str) -> bool {
                     setreg!(a, Value::Ref(r));
                 }
                 0x24 => {
-                    // filled-new-array {..}, type@CCCC (35c shape)
+                    // filled-new-array {..}, type@CCCC (35c shape). Unlike
+                    // invoke, the type sits in unit 1 and the register list
+                    // in unit 2.
                     let (idxs, _, _) = self.decode_35c(insns, pc);
-                    let elems: Vec<Value> = idxs.iter().map(|&i| reg!(i)).collect();
-                    let t = insns[pc + 2] as TypeIdx;
+                    let elems: Vec<Value> = idxs
+                        .iter()
+                        .map(|&i| regs.get(i).cloned().unwrap_or(Value::Void))
+                        .collect();
+                    let t = insns[pc + 1] as TypeIdx;
+                    let r = self.new_array(t, elems.len());
+                    self.heap[r as usize].elems = Some(elems);
+                    setreg!(aa, Value::Ref(r));
+                }
+                0x25 => {
+                    // filled-new-array/range {vC..vC+AA-1}, type@BBBB (3rc)
+                    let count = ((unit >> 8) & 0xff) as usize;
+                    let t = insns[pc + 1] as TypeIdx;
+                    let start = insns[pc + 2] as usize;
+                    let elems: Vec<Value> = (start..start + count)
+                        .map(|i| reg!(i))
+                        .collect();
                     let r = self.new_array(t, elems.len());
                     self.heap[r as usize].elems = Some(elems);
                     setreg!(aa, Value::Ref(r));
@@ -1220,6 +1246,29 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             ) => Value::Void,
             ("androidx/lifecycle/ViewModelProvider", "get") => {
                 Value::Ref(0)
+            }
+            // Jetpack Compose. setContent builds a composable tree and hands it
+            // to a renderer we don't have; answering it as satisfied lets the
+            // Activity finish its startup without a graphics stack.
+            (
+                "androidx/activity/compose/ComponentActivityKt",
+                "setContent$default" | "setContent",
+            ) => Value::Void,
+            (
+                "androidx/compose/runtime/internal/ComposableLambdaKt",
+                "composableLambdaInstance" | "composableLambdaInstance$default",
+            ) => {
+                let l = self.new_holder("Landroidx/compose/runtime/internal/ComposableLambda;");
+                Value::Ref(l)
+            }
+            // Kotlin's lateinit guard. The getter compiles to
+            //   sfield; if-eqz -> throwUninitializedProperty
+            // so the read already happened by the time we're called; returning
+            // lets the caller use that (unset) value rather than abort.
+            ("kotlin/jvm/internal/Intrinsics", "throwUninitializedProperty")
+            | ("kotlin/jvm/internal/Intrinsics", "checkNotNullExpressionValue") => Value::Void,
+            ("kotlin/jvm/internal/Intrinsics", "checkNotNull") => {
+                args.first().cloned().unwrap_or(Value::Ref(0))
             }
             // Dagger/Hilt assertion helpers. They exist to abort startup when
             // a component graph is misconfigured; since there is no real graph
