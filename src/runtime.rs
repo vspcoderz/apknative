@@ -196,6 +196,100 @@ impl Runtime {
         idx
     }
 
+    /// Invoke the `@Composable` content lambda that setContent was given.
+    ///
+    /// The lambda is a `Function2<Composer, Int, Unit>`. Rather than match on
+    /// argument position -- which differs between `setContent` and its
+    /// `$default` synthetic -- the receiver is located by its class, since
+    /// only one argument is a Function2.
+    fn compose_content(&mut self, args: &[Value]) -> Option<Value> {
+        // The generated implementation declares a concrete
+        // invoke(Composer, int) alongside an erased bridge, so call the
+        // concrete one and skip the bridge's casts.
+        const SIG: &str = "(Landroidx/compose/runtime/Composer;I)Ljava/lang/Object;";
+
+        // Which argument is the content lambda is decided structurally, not
+        // by position or name: in a real app it is a ComposableLambda, whose
+        // class name says nothing about being a Function2. The one argument
+        // that has an invoke(Composer, Int, Object) is it.
+        let mut target: Option<(usize, TypeIdx, Value)> = None;
+        for v in args.iter().skip(1) {
+            let r = v.as_ref();
+            if r == 0 {
+                continue;
+            }
+            let Some(ci) = self.heap.get(r as usize).map(|o| o.class_idx) else {
+                continue;
+            };
+            if ci == NO_INDEX {
+                continue;
+            }
+            // A class index is only meaningful inside the DEX it came from,
+            // and we do not know which file the object was allocated in, so
+            // search them all. lookup validates the descriptor, so a wrong
+            // file simply does not match.
+            for dexid in 0..self.dexes.len() {
+                if self.lookup(dexid, ci, "invoke", Some(SIG)).is_some() {
+                    target = Some((dexid, ci, v.clone()));
+                    break;
+                }
+            }
+            if target.is_some() {
+                break;
+            }
+        }
+        let Some((dexid, ti, recv)) = target else {
+            return Some(Value::Void);
+        };
+
+        let composer = self.new_holder("Landroidx/compose/runtime/Composer;");
+        let saved = self.cur;
+        self.cur = dexid;
+
+        // A composable that throws is a real result: report it rather than
+        // silently claiming the UI composed.
+        let r = match self.lookup(self.cur, ti, "invoke", Some(SIG)) {
+            Some((d, enc, m)) if enc.code_off != 0 => self
+                // invoke is an instance method: receiver, Composer, changed.
+                .exec(d, m, vec![recv, Value::Ref(composer), Value::Int(0)], 0)
+                .map(|_| Value::Void),
+            _ => Err("content lambda has no invoke".into()),
+        };
+        self.cur = saved;
+
+        if let Err(e) = &r {
+            eprintln!("apknative: composable failed: {e}");
+        }
+        Some(r.unwrap_or(Value::Void))
+    }
+
+    /// The class the Compose compiler generates for a composable lambda.
+    /// Found by scanning descriptors rather than hardcoded, so an app that
+    /// ships a differently-named implementation still works.
+    fn composable_lambda_class(&mut self) -> TypeIdx {
+        // Every file: the class is usually in whichever DEX the Compose
+        // library landed in, which is not the one the caller is running from.
+        for dex in self.dexes.iter() {
+            if let Some(i) = dex
+                .types
+                .iter()
+                .position(|&s| dex.string(s).ends_with("/ComposableLambdaImpl;"))
+            {
+                return i as TypeIdx;
+            }
+        }
+        self.type_index_for("Landroidx/compose/runtime/internal/ComposableLambdaImpl;")
+    }
+
+    /// Index of a field declared directly on a class, by name.
+    fn field_index_for(&self, class: TypeIdx, name: &str) -> Option<FieldIdx> {
+        self.d()
+            .fields
+            .iter()
+            .position(|f| f.class as u32 == class && self.d().string(f.name) == name)
+            .map(|i| i as FieldIdx)
+    }
+
     /// The process-wide Application object, created on first use.
     fn application(&mut self) -> Value {
         if let Some(i) = self.services.get("__application") {
@@ -1304,17 +1398,55 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
                 Value::Ref(0)
             }
             // Jetpack Compose. setContent builds a composable tree and hands it
-            // to a renderer we don't have; answering it as satisfied lets the
-            // Activity finish its startup without a graphics stack.
+            // Jetpack Compose. setContent is normally handed a ComposeView
+            // and a WindowRecomposer -- real Android view plumbing we have no
+            // window for. But the content lambda itself is ordinary bytecode,
+            // and it is the thing that actually builds the UI, so invoke it
+            // directly against our own Composer. Skipping the View is the
+            // whole trick: no window means nothing would otherwise ever
+            // compose.
             (
                 "androidx/activity/compose/ComponentActivityKt",
                 "setContent$default" | "setContent",
-            ) => Value::Void,
+            ) => return self.compose_content(args),
+            // The Compose group protocol. The compiler brackets each
+            // composable's emissions with start/endRestartGroup; a Composer
+            // that hands itself straight back and reports nothing changed keeps
+            // the structure flat, but the composable body runs to the end --
+            // which is the point. Claiming "changed" would restart the group
+            // forever and re-emit nothing.
+            (
+                "androidx/compose/runtime/Composer",
+                "startRestartGroup" | "startReplaceableGroup" | "startRestartGroupPassingParams",
+            ) => args.first().cloned().unwrap_or(Value::Ref(0)),
+            (
+                "androidx/compose/runtime/Composer",
+                "endRestartGroup" | "endReplaceableGroup" | "endRestartGroupPassingParams",
+            ) => Value::Ref(self.new_holder("Landroidx/compose/runtime/internal/ScopeUpdateScope;")),
+            ("androidx/compose/runtime/Composer", "changed" | "changedInstance") => Value::Int(0),
+            // A checkcast guard Kotlin emits before invoking a Function2 of a
+            // known arity. Passing the object through is the whole job.
+            ("kotlin/jvm/internal/TypeIntrinsics", "beforeCheckcastToFunctionOfArity") => {
+                args.get(1).cloned().unwrap_or(Value::Ref(0))
+            }
+            // The ComposableLambda returned here is the implementation class,
+            // not the interface: the interface declares no methods, so a
+            // lookup starting from it finds nothing to call.
             (
                 "androidx/compose/runtime/internal/ComposableLambdaKt",
                 "composableLambdaInstance" | "composableLambdaInstance$default",
             ) => {
-                let l = self.new_holder("Landroidx/compose/runtime/internal/ComposableLambda;");
+                let ci = self.composable_lambda_class();
+                let l = self.alloc(ci);
+                self.heap[l as usize].elems = Some(Vec::new());
+                // `_block` is the actual lambda. Without it the generated
+                // invoke() dereferences null on its first instruction.
+                if let (Some(block), Some(fi)) = (
+                    args.get(3).cloned(),
+                    self.field_index_for(ci, "_block"),
+                ) {
+                    self.heap[l as usize].fields.insert(fi, block);
+                }
                 Value::Ref(l)
             }
             // android.content.Context. These have no real answer without a
@@ -1339,7 +1471,11 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             //   sfield; if-eqz -> throwUninitializedProperty
             // so the read already happened by the time we're called; returning
             // lets the caller use that (unset) value rather than abort.
+            // Both spellings exist in the wild: the property getter calls
+            // throwUninitializedPropertyAccessException, and the $delegate
+            // path calls throwUninitializedProperty.
             ("kotlin/jvm/internal/Intrinsics", "throwUninitializedProperty")
+            | ("kotlin/jvm/internal/Intrinsics", "throwUninitializedPropertyAccessException")
             | ("kotlin/jvm/internal/Intrinsics", "checkNotNullExpressionValue") => Value::Void,
             ("kotlin/jvm/internal/Intrinsics", "checkNotNull") => {
                 args.first().cloned().unwrap_or(Value::Ref(0))
