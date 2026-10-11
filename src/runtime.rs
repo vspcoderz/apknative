@@ -1208,6 +1208,19 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             ("androidx/lifecycle/Lifecycle", "getCurrentState") => {
                 Value::Ref(self.new_holder("Landroidx/lifecycle/Lifecycle$State;"))
             }
+            // The Activity lifecycle itself. Fragment/ViewModel setup needs a
+            // real FragmentManager and windowing, so the lifecycle callbacks
+            // become no-ops and the Activity's own onCreate does the work.
+            (
+                "androidx/fragment/app/FragmentActivity"
+                | "androidx/activity/ComponentActivity"
+                | "android/app/Activity",
+                "onCreate" | "onStart" | "onResume" | "onPause" | "onStop" | "onDestroy"
+                | "onNewIntent" | "onSaveInstanceState" | "onRestoreInstanceState",
+            ) => Value::Void,
+            ("androidx/lifecycle/ViewModelProvider", "get") => {
+                Value::Ref(0)
+            }
             _ => {
                 // `isAtLeast` is checked during registration, where AndroidX
                 // requires the owner to *not* be STARTED yet ("must call
