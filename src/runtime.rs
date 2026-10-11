@@ -97,6 +97,11 @@ impl Value {
 }
 
 pub struct Object {
+    /// Which DEX `class_idx` is an index into. A type index means nothing
+    /// outside its own file, so resolving a method on an object needs both
+    /// halves -- and the object was allocated while some *other* method was
+    /// running, which is not necessarily the one calling it now.
+    pub dex: usize,
     pub class_idx: TypeIdx,
     pub fields: HashMap<FieldIdx, Value>,
     pub string: Option<String>,
@@ -165,6 +170,7 @@ impl Runtime {
 
     pub fn alloc(&mut self, class_idx: TypeIdx) -> u32 {
         self.heap.push(Object {
+            dex: self.cur,
             class_idx,
             fields: HashMap::new(),
             string: None,
@@ -266,27 +272,34 @@ impl Runtime {
     /// The class the Compose compiler generates for a composable lambda.
     /// Found by scanning descriptors rather than hardcoded, so an app that
     /// ships a differently-named implementation still works.
-    fn composable_lambda_class(&mut self) -> TypeIdx {
-        // Every file: the class is usually in whichever DEX the Compose
-        // library landed in, which is not the one the caller is running from.
-        for dex in self.dexes.iter() {
+    /// The class the Compose compiler generates for a composable lambda, and
+    /// the DEX holding it.
+    ///
+    /// Both halves are needed together: a type index and a field index are only
+    /// meaningful inside their own file, and this class lands in whichever DEX
+    /// Compose shipped in, not the one the caller is running from.
+    fn composable_lambda_class(&mut self) -> (usize, TypeIdx) {
+        for (n, dex) in self.dexes.iter().enumerate() {
             if let Some(i) = dex
                 .types
                 .iter()
                 .position(|&s| dex.string(s).ends_with("/ComposableLambdaImpl;"))
             {
-                return i as TypeIdx;
+                return (n, i as TypeIdx);
             }
         }
-        self.type_index_for("Landroidx/compose/runtime/internal/ComposableLambdaImpl;")
+        (self.cur, self.type_index_for(
+            "Landroidx/compose/runtime/internal/ComposableLambdaImpl;",
+        ))
     }
 
-    /// Index of a field declared directly on a class, by name.
-    fn field_index_for(&self, class: TypeIdx, name: &str) -> Option<FieldIdx> {
-        self.d()
-            .fields
+    /// Index of a field declared directly on a class, searched in one specific
+    /// DEX.
+    fn field_index_in(&self, dex_id: usize, class: TypeIdx, name: &str) -> Option<FieldIdx> {
+        let dex = self.dexes.get(dex_id)?;
+        dex.fields
             .iter()
-            .position(|f| f.class as u32 == class && self.d().string(f.name) == name)
+            .position(|f| f.class as u32 == class && dex.string(f.name) == name)
             .map(|i| i as FieldIdx)
     }
 
@@ -1423,11 +1436,31 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
                 "androidx/compose/runtime/Composer",
                 "endRestartGroup" | "endReplaceableGroup" | "endRestartGroupPassingParams",
             ) => Value::Ref(self.new_holder("Landroidx/compose/runtime/internal/ScopeUpdateScope;")),
+            // A first composition compares against an empty slot table, so
+            // nothing has changed. Reporting true would send the runtime down
+            // the invalidate path instead of running the block.
             ("androidx/compose/runtime/Composer", "changed" | "changedInstance") => Value::Int(0),
+            // The gate every composable opens with. Answering false makes the
+            // body skip itself entirely, which is why the tree came out empty.
+            ("androidx/compose/runtime/Composer", "shouldExecute") => Value::Int(1),
+            // `remember` reads a slot then writes back the new value. With no
+            // slot table every read is empty, which for a single composition
+            // means the value is never restored -- correct enough to render
+            // once, wrong for anything that recomposes.
+            ("androidx/compose/runtime/Composer", "rememberedValue") => Value::Ref(0),
+            ("androidx/compose/runtime/Composer", "updateRememberedValue") => Value::Void,
+            ("androidx/compose/runtime/Composer$Companion", "getEmpty") => {
+                Value::Ref(self.new_holder("Ljava/lang/Object;"))
+            }
+            ("androidx/compose/runtime/ComposerKt", "isTraceInProgress") => Value::Int(0),
+            ("androidx/compose/runtime/Composer", "skipToGroupEnd") => Value::Void,
             // A checkcast guard Kotlin emits before invoking a Function2 of a
-            // known arity. Passing the object through is the whole job.
+            // known arity. Passing the object through is the whole job. The
+            // arity is the second argument because this one is static, so the
+            // object is first -- reading args[1] returns the arity and the
+            // composable body never gets invoked.
             ("kotlin/jvm/internal/TypeIntrinsics", "beforeCheckcastToFunctionOfArity") => {
-                args.get(1).cloned().unwrap_or(Value::Ref(0))
+                args.first().cloned().unwrap_or(Value::Ref(0))
             }
             // The ComposableLambda returned here is the implementation class,
             // not the interface: the interface declares no methods, so a
@@ -1436,14 +1469,16 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
                 "androidx/compose/runtime/internal/ComposableLambdaKt",
                 "composableLambdaInstance" | "composableLambdaInstance$default",
             ) => {
-                let ci = self.composable_lambda_class();
+                let (owner, ci) = self.composable_lambda_class();
                 let l = self.alloc(ci);
                 self.heap[l as usize].elems = Some(Vec::new());
-                // `_block` is the actual lambda. Without it the generated
-                // invoke() dereferences null on its first instruction.
+                // `_block` is the actual lambda, and it is the third argument:
+                // this is a static file-facade factory, so there is no receiver
+                // shifting the positions. Without it the generated invoke()
+                // calls null and the composable body never runs.
                 if let (Some(block), Some(fi)) = (
-                    args.get(3).cloned(),
-                    self.field_index_for(ci, "_block"),
+                    args.get(2).cloned(),
+                    self.field_index_in(owner, ci, "_block"),
                 ) {
                     self.heap[l as usize].fields.insert(fi, block);
                 }
@@ -1534,11 +1569,23 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             }
         }
 
-        let result = if matches!(op, 0x6e | 0x74) {
+        // invoke-interface resolves on the receiver's runtime class, exactly
+        // like invoke-virtual -- the method_id names an abstract interface
+        // method with no code, so dispatching straight to it silently does
+        // nothing. That swallowed every Kotlin lambda and every Compose
+        // composable body.
+        let result = if matches!(op, 0x6e | 0x72 | 0x74 | 0x78) {
             let name = self.d().string(self.d().methods[mid as usize].name).to_string();
             let sig = self.sig_in(&self.d().methods[mid as usize]);
-            let recv = args.first().and_then(|v| self.obj(v.as_ref())).map(|o| o.class_idx);
-            match recv.and_then(|rc| self.lookup(dex_id, rc, &name, Some(&sig))) {
+            // Resolve against the receiver's own file, not the caller's. A
+            // Compose lambda allocated in classes2.dex is still being invoked
+            // from a method in classes.dex, and reading its class index there
+            // names an unrelated class -- so the call silently found nothing.
+            let recv = args
+                .first()
+                .and_then(|v| self.obj(v.as_ref()))
+                .map(|o| (o.dex, o.class_idx));
+            match recv.and_then(|(rd, rc)| self.lookup(rd, rc, &name, Some(&sig))) {
                 Some((d, enc, m)) => self.exec_resolved(d, enc, m, args, depth + 1),
                 None => self.exec(dex_id, mid, args, depth + 1),
             }
