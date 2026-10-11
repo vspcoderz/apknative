@@ -8,3 +8,5 @@
 *.apk
 *.dex
 *.dis
+# Local build driver -- points at a personal VPS, not part of the project
+/vps.sh

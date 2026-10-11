@@ -10,11 +10,9 @@ pub type MethodIdx = u32;
 pub type FieldIdx = u32;
 
 pub const ACC_STATIC: u32 = 0x0008;
-pub const ACC_NATIVE: u32 = 0x0100;
 
 #[derive(Debug, Clone)]
 pub struct Proto {
-    pub shorty: StrIdx,
     pub ret: TypeIdx,
     pub params: Vec<TypeIdx>,
 }
@@ -22,7 +20,6 @@ pub struct Proto {
 #[derive(Debug, Clone)]
 pub struct FieldId {
     pub class: u16,
-    pub ty: u16,
     pub name: StrIdx,
 }
 
@@ -38,8 +35,6 @@ pub struct ClassDef {
     pub class_idx: TypeIdx,
     pub access_flags: u32,
     pub superclass_idx: TypeIdx,
-    pub interfaces_off: u32,
-    pub source_file_idx: StrIdx,
     pub class_data_off: u32,
 }
 
@@ -62,8 +57,6 @@ pub struct ClassData {
 pub struct CodeItem {
     pub registers_size: u16,
     pub ins_size: u16,
-    pub outs_size: u16,
-    pub tries_size: u16,
     pub insns: Vec<u16>,
 }
 
@@ -207,7 +200,7 @@ impl Dex {
         let mut r = R::new(&data, proto_ids_off);
         let mut protos = Vec::with_capacity(proto_ids_size);
         for _ in 0..proto_ids_size {
-            let shorty = r.u32()?;
+            r.u32()?; // shorty descriptor, validated implicitly by its length
             let ret = r.u32()?;
             let params_off = r.u32()? as usize;
             let params = if params_off == 0 {
@@ -221,16 +214,17 @@ impl Dex {
                 }
                 v
             };
-            protos.push(Proto { shorty, ret, params });
+            protos.push(Proto { ret, params });
         }
 
         // field_ids: 8 bytes each
         let mut r = R::new(&data, field_ids_off);
         let mut fields = Vec::with_capacity(field_ids_size);
         for _ in 0..field_ids_size {
+            let class = r.u16()?;
+            r.u16()?; // field type descriptor index
             fields.push(FieldId {
-                class: r.u16()?,
-                ty: r.u16()?,
+                class,
                 name: r.u32()?,
             });
         }
@@ -253,8 +247,8 @@ impl Dex {
             let class_idx = r.u32()?;
             let access_flags = r.u32()?;
             let superclass_idx = r.u32()?;
-            let interfaces_off = r.u32()?;
-            let source_file_idx = r.u32()?;
+            r.u32()?; // interfaces_off
+            r.u32()?; // source_file_idx
             let _annotations_off = r.u32()?;
             let class_data_off = r.u32()?;
             let _static_values_off = r.u32()?;
@@ -262,8 +256,6 @@ impl Dex {
                 class_idx,
                 access_flags,
                 superclass_idx,
-                interfaces_off,
-                source_file_idx,
                 class_data_off,
             });
         }
@@ -358,8 +350,8 @@ impl Dex {
         let mut r = R::new(&self.data, off as usize);
         let registers_size = r.u16()?;
         let ins_size = r.u16()?;
-        let outs_size = r.u16()?;
-        let tries_size = r.u16()?;
+        r.u16()?; // outs_size
+        r.u16()?; // tries_size
         let _debug_info_off = r.u32()?;
         let insns_size = r.u32()? as usize;
         let mut insns = Vec::with_capacity(insns_size);
@@ -371,8 +363,6 @@ impl Dex {
         Ok(CodeItem {
             registers_size,
             ins_size,
-            outs_size,
-            tries_size,
             insns,
         })
     }

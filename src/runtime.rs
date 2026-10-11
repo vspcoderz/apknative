@@ -105,8 +105,6 @@ pub struct Object {
     pub represents: Option<TypeIdx>,
     /// Single-value slot for boxed primitives and atomics.
     pub value: Option<Value>,
-    /// Insertion-order key for hash-based collections; `elems` holds payload.
-    pub hash_key: Option<u64>,
 }
 
 pub struct Runtime {
@@ -173,7 +171,6 @@ impl Runtime {
             elems: None,
             represents: None,
             value: None,
-            hash_key: None,
         });
         (self.heap.len() - 1) as u32
     }
@@ -224,7 +221,8 @@ impl Runtime {
     /// then call methods on it, so it needs a class descriptor.
     fn service_descriptor(&mut self, name: &str) -> u32 {
         match name {
-            "layout_inflater" | "window" => self.service("Landroid/view/LayoutInflater;").as_ref(),
+            "layout_inflater" => self.service("Landroid/view/LayoutInflater;").as_ref(),
+            "window" => self.service("Landroid/view/WindowManager;").as_ref(),
             "activity_manager" | "window_manager" => {
                 self.service("Landroid/app/ActivityManager;").as_ref()
             }
@@ -599,7 +597,7 @@ pub fn has_class(&self, name: &str) -> bool {
         // Callee params live in the *last* `ins_size` registers.
         let want = code.ins_size as usize;
         let base = code.registers_size as usize - want;
-        let supplied = if is_static { want } else { want };
+        let supplied = want;
         if args.len() < supplied {
             let mid = &self.d().methods[enc.method_idx as usize];
             let params: Vec<&str> = self
@@ -1034,11 +1032,27 @@ pub fn has_class(&self, name: &str) -> bool {
                     let a = ((unit >> 8) & 0x0f) as usize;
                     let b = ((unit >> 12) & 0x0f) as usize;
                     let off = insns[pc + 1] as i16 as i32;
-                    let x = reg!(a).as_long();
-                    let y = reg!(b).as_long();
+                    let (rv_x, rv_y) = (reg!(a), reg!(b));
+                    // Equality must compare the register's actual contents.
+                    // Coercing to a number first turns every object reference
+                    // into 0, which makes `a == b` true for all a and b --
+                    // and object identity checks are everywhere in real app
+                    // code. Dalvik compares floats bitwise, so NaN equals
+                    // itself here too; match that.
+                    let bits = |v: &Value| -> u64 {
+                        match v {
+                            Value::Void => 0,
+                            Value::Int(i) => *i as u32 as u64,
+                            Value::Ref(r) => *r as u64,
+                            Value::Long(l) => *l as u64,
+                            Value::Float(f) => f.to_bits() as u64,
+                            Value::Double(d) => d.to_bits(),
+                        }
+                    };
+                    let (x, y) = (rv_x.as_long(), rv_y.as_long());
                     let take = match op {
-                        0x32 => x == y,
-                        0x33 => x != y,
+                        0x32 => bits(&rv_x) == bits(&rv_y),
+                        0x33 => bits(&rv_x) != bits(&rv_y),
                         0x34 => x < y,
                         0x35 => x >= y,
                         0x36 => x > y,
@@ -1456,7 +1470,7 @@ fn obj(&self, r: u32) -> Option<&Object> {
     /// diagnostic — it tells us which framework call the app was attempting.
     fn exception_text(&self, v: &Value) -> String {
         match self.obj(v.as_ref()) {
-            Some(o) => format!("{}", self.d().class_name(o.class_idx)),
+            Some(o) => self.d().class_name(o.class_idx).to_string(),
             None => self.describe(v),
         }
     }
@@ -1495,6 +1509,10 @@ fn obj(&self, r: u32) -> Option<&Object> {
         let class = self.d().class_name(m.class as TypeIdx);
         let name = self.d().string(m.name).to_string();
         let ret = self.d().type_name(self.d().proto(m.proto).unwrap().ret).to_string();
+        // The callee's own signature. javac calls StringBuilder.append(Z)
+        // directly, so the only place the boolean-ness survives is here -- a
+        // Value::Int(1) is otherwise indistinguishable from the integer 1.
+        let sig = self.sig_in(m);
 
         if name == "<init>" || name == "<clinit>" {
             return Ok(Value::Void);
@@ -1639,6 +1657,44 @@ fn obj(&self, r: u32) -> Option<&Object> {
             }
         }
 
+        // Boxing. A boxed value has to carry its own rendering: Java's string
+        // concatenation reaches Boolean.valueOf -> toString, and returning the
+        // bare int made `false` print as `0` and `true` as `1`.
+        if class == "java/lang/Boolean" {
+            match name.as_str() {
+                "valueOf" => {
+                    let b = args.first().map(|v| v.as_int()).unwrap_or(0) != 0;
+                    let idx = self.new_holder("Ljava/lang/Boolean;");
+                    self.heap[idx as usize].value = Some(Value::Int(i32::from(b)));
+                    self.heap[idx as usize].string =
+                        Some(if b { "true".into() } else { "false".into() });
+                    return Ok(Value::Ref(idx));
+                }
+                "booleanValue" => {
+                    let recv = args.first().map(|v| v.as_ref()).unwrap_or(0);
+                    let idx = self.ensure_cell(recv, &class);
+                    let v = self.heap[idx as usize].value.clone().unwrap_or(Value::Int(0));
+                    return Ok(Value::Int(i32::from(v.as_int() != 0)));
+                }
+                "parseBoolean" => {
+                    let t = self
+                        .string_text(args.first().unwrap_or(&Value::Void))
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    return Ok(Value::Int(i32::from(t == "true")));
+                }
+                "toString" => {
+                    let recv = args.first().map(|v| v.as_ref()).unwrap_or(0);
+                    let idx = self.ensure_cell(recv, &class);
+                    let v = self.heap[idx as usize].value.clone().unwrap_or(Value::Int(0));
+                    let r = self.new_string(if v.as_int() != 0 { "true" } else { "false" });
+                    return Ok(Value::Ref(r));
+                }
+                _ => {}
+            }
+        }
+
         if class == "java/lang/Integer" || class == "java/lang/Long" {
             match name.as_str() {
                 "parseInt" | "parseLong" => {
@@ -1676,10 +1732,16 @@ fn obj(&self, r: u32) -> Option<&Object> {
                 }
                 "length" => return Ok(Value::Int(cur.chars().count() as i32)),
                 _ => {
-                    let more = args
-                        .get(1)
-                        .map(|v| self.describe(v))
-                        .unwrap_or_else(|| "null".into());
+                    let more = if sig.starts_with("append(Z)") {
+                        match args.get(1) {
+                            Some(v) => (v.as_int() != 0).to_string(),
+                            None => "null".into(),
+                        }
+                    } else {
+                        args.get(1)
+                            .map(|v| self.describe(v))
+                            .unwrap_or_else(|| "null".into())
+                    };
                     let mut s = cur;
                     s.push_str(&more);
                     self.heap[idx as usize].string = Some(s);
@@ -1734,7 +1796,7 @@ fn obj(&self, r: u32) -> Option<&Object> {
                     if let Some(e) = self.heap[idx as usize].elems.as_mut() {
                         if is_set {
                             // Sets reject duplicates; compare by identity.
-                            added = !e.iter().any(|x| *x == a1);
+                            added = !e.contains(&a1);
                             if added {
                                 e.push(a1);
                             }
@@ -1779,7 +1841,7 @@ fn obj(&self, r: u32) -> Option<&Object> {
                     let hit = self.heap[idx as usize]
                         .elems
                         .as_ref()
-                        .map(|e| e.iter().any(|x| *x == a1))
+                        .map(|e| e.contains(&a1))
                         .unwrap_or(false);
                     return Ok(Value::Int(i32::from(hit)));
                 }
@@ -1812,7 +1874,7 @@ fn obj(&self, r: u32) -> Option<&Object> {
                         .elems
                         .clone()
                         .unwrap_or_default();
-                    let step = if name == "keySet" { 2 } else { 2 };
+                    let step = 2;
                     let skip = usize::from(name == "values");
                     let mut out = Vec::new();
                     let mut i = skip;

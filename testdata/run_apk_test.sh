@@ -53,6 +53,13 @@ expected=(
   "0^2=0 1^2=1 2^2=4 3^2=9 4^2=16"
   "2^40 = 1099511627776"
   "activity finished"
+  "DemoActivity.onStart()"
+  "DemoActivity.onResume()"
+  "application stable = true"
+  "resources stable = true"
+  "service stable = true"
+  "distinct services differ = true"
+  "package = org.fdroid"
 )
 
 fail=0

@@ -40,7 +40,7 @@ fn u32le(d: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
 }
 
-fn safe<'a>(d: &'a [u8], o: usize, n: usize) -> Result<&'a [u8], String> {
+fn safe(d: &[u8], o: usize, n: usize) -> Result<&[u8], String> {
     d.get(o..o + n)
         .ok_or_else(|| format!("AXML read past end at 0x{o:x}"))
 }
@@ -90,7 +90,7 @@ fn parse_string_pool(d: &[u8]) -> Result<Vec<String>, String> {
             let units = safe(d, start, len * 2)?;
             String::from_utf16_lossy(
                 &units
-                    .chunks_exact(2)
+                    .as_chunks::<2>().0.iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect::<Vec<u16>>(),
             )
@@ -173,10 +173,10 @@ pub fn parse(d: &[u8]) -> Result<Node, String> {
 
                 let mut node = Node {
                     name: pool_string(&pool, name_idx),
-                    attrs: Vec::with_capacity(attr_count as usize),
+                    attrs: Vec::with_capacity(attr_count),
                     children: Vec::new(),
                 };
-                for i in 0..attr_count as usize {
+                for i in 0..attr_count {
                     let aoff = attr_start + i * attr_size;
                     if aoff + 20 > body.len() {
                         break;

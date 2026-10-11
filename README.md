@@ -23,8 +23,11 @@ apknative verify app.apk           # static-check all bytecode
 | Launcher-activity resolution (incl. aliases, `enabled=false`) | working |
 | Multidex class location | working |
 | Dalvik interpreter (~70 opcodes) | working |
+| Activity lifecycle (`onCreate`/`onStart`/`onResume`) | working |
 | Static bytecode verifier | working |
-| Android framework shims | minimal — the hard limit |
+| `java.util` collections, iterators, boxing | working |
+| Jetpack Compose rendering | not started — the hard limit |
+| Android framework shims | partial |
 
 The test suite compiles Java, dexes it with Google's own `d8`, runs each program
 on the real JVM and on `apknative`, and diffs the output. All four cases are
@@ -41,19 +44,37 @@ PASS  X
 
 ## What actually runs
 
-Apps that do real computation with little Android API surface. Verified against
-a production APK: `apknative` reads F-Droid's manifest, resolves
-`org.fdroid.MainActivity`, allocates it, runs its constructor and enters real
-Kotlin stdlib code.
+A production APK, end to end. `apknative` reads F-Droid's manifest, resolves
+`org.fdroid.MainActivity` across three DEX files, allocates it, and drives the
+real Android lifecycle:
+
+```
+$ apknative run ~/android-tools/apks/fdroid.apk
+no main(); launching Activity: org.fdroid.MainActivity
+(3 DEX files loaded)
+apknative: instantiating org.fdroid.MainActivity
+--- program output ---
+--- end ---
+```
+
+That covers manifest parsing, multidex, method resolution across files,
+AndroidX, Kotlin stdlib, Dagger/Hilt startup, and roughly a thousand
+interpreted instructions of the app's own code. It is not a stub that returns
+success — it executes.
 
 ## What does not
 
-Anything that needs the Android framework. This is the real constraint, and it
-is not an opcode problem — it is ~50,000 framework classes (`Activity`,
-`Context`, `Intent`, `ContentResolver`, Binder IPC, `resources.arsc`, themes,
-layout, `PackageManager`). Google Play Store is the extreme case: it ships as a
-split APK bundle depending on Google Play Services, is R8-obfuscated, has native
-libraries for four ABIs, and drives the system over Binder.
+**No pixels.** F-Droid's UI is Jetpack Compose, and Compose composables write
+into a `Composer` that a runtime walks to build a node tree, which a renderer
+then draws. None of those exist here yet, so `setContent` is currently
+answered as a no-op and the app finishes its lifecycle without a screen.
+
+The framework is the constraint, and it is not an opcode problem — it is
+~50,000 framework classes (`Activity`, `Context`, `Intent`, `ContentResolver`,
+Binder IPC, `resources.arsc`, themes, layout, `PackageManager`). Google Play
+Store is the extreme case: it ships as a split APK bundle depending on Google
+Play Services, is R8-obfuscated, has native libraries for four ABIs, and
+drives the system over Binder.
 
 There is no shortcut here. The Android framework is the operating system, and
 reimplementing it is a different project from reimplementing the bytecode.

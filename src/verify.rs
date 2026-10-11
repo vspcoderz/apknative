@@ -119,7 +119,7 @@ pub fn verify(dex: &Dex) -> Vec<String> {
                 let next = if pc + 1 < len { insns[pc + 1] as usize } else { 0 };
                 let next_hi = if pc + 1 < len { (insns[pc + 1] >> 8) as usize } else { 0 };
 
-                let mut check_reg = |r: usize, errs: &mut Vec<String>| {
+                let check_reg = |r: usize, errs: &mut Vec<String>| {
                     if r >= nregs {
                         errs.push(format!(
                             "{label}: opcode 0x{op:02x} at 0x{pc:04x} touches v{r}, frame has {nregs}"
@@ -172,12 +172,11 @@ pub fn verify(dex: &Dex) -> Vec<String> {
                     // 21c — AA plus an index (field/string/type), not a register.
                     0x60..=0x6d => check_reg(aa, &mut errs),
                     // 32x — two full 16-bit registers.
-                    0x03 | 0x06 | 0x09 => {
-                        if pc + 2 < len {
+                    0x03 | 0x06 | 0x09
+                        if pc + 2 < len => {
                             check_reg(insns[pc + 1] as usize, &mut errs);
                             check_reg(insns[pc + 2] as usize, &mut errs);
                         }
-                    }
                     _ => {}
                 }
 
