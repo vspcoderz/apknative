@@ -1,0 +1,10 @@
+# Rust build output
+/target/
+
+# Generated test fixtures (rebuilt by testdata/run_tests.sh)
+/testdata/build/
+
+# Local scratch
+*.apk
+*.dex
+*.dis

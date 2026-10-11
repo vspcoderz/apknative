@@ -1,0 +1,11 @@
+[package]
+name = "apknative"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flate2 = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
