@@ -1200,7 +1200,7 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
     /// we don't model — `Lifecycle$State.isAtLeast` compares ordinals against a
     /// static `STARTED` we can never populate. Resolving those would run the
     /// real code and fail, so they are intercepted here instead.
-    fn framework_override(&mut self, class: &str, name: &str) -> Option<Value> {
+    fn framework_override(&mut self, class: &str, name: &str, args: &[Value]) -> Option<Value> {
         let r = match (class, name) {
             ("androidx/lifecycle/LifecycleOwner", "getLifecycle") => {
                 Value::Ref(self.new_holder("Landroidx/lifecycle/Lifecycle;"))
@@ -1220,6 +1220,17 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             ) => Value::Void,
             ("androidx/lifecycle/ViewModelProvider", "get") => {
                 Value::Ref(0)
+            }
+            // Dagger/Hilt assertion helpers. They exist to abort startup when
+            // a component graph is misconfigured; since there is no real graph
+            // here, treating them as satisfied is what lets startup continue.
+            ("dagger/hilt/internal/Preconditions", "checkState") | ("dagger/internal/Preconditions", "checkState") => {
+                Value::Void
+            }
+            ("dagger/hilt/internal/Preconditions", "checkNotNull")
+            | ("dagger/internal/Preconditions", "checkNotNull")
+            | ("dagger/hilt/internal/Preconditions", "checkBuilderRequirement") => {
+                args.first().cloned().unwrap_or(Value::Ref(0))
             }
             _ => {
                 // `isAtLeast` is checked during registration, where AndroidX
@@ -1258,7 +1269,7 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             let site = &self.d().methods[mid as usize];
             let cls = self.d().class_name(site.class as TypeIdx);
             let mname = self.d().string(site.name).to_string();
-            if let Some(v) = self.framework_override(&cls, &mname) {
+            if let Some(v) = self.framework_override(&cls, &mname, &args) {
                 self.cur = saved;
                 return Ok(v);
             }
