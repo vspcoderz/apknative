@@ -120,6 +120,10 @@ pub struct Runtime {
     pub heap: Vec<Object>,
     pub statics: HashMap<FieldIdx, Value>,
     pub system_out: u32,
+    /// System services are singletons per process: an app routinely asks for
+    /// the same service twice and compares the results. Keyed by name so each
+    /// service gets one stable object.
+    pub services: HashMap<String, u32>,
 }
 
 impl Runtime {
@@ -131,6 +135,7 @@ impl Runtime {
             heap: Vec::new(),
             statics: HashMap::new(),
             system_out: 0,
+            services: HashMap::new(),
         }
     }
 
@@ -192,6 +197,43 @@ impl Runtime {
         let idx = self.alloc(t);
         self.heap[idx as usize].elems = Some(Vec::new());
         idx
+    }
+
+    /// The process-wide Application object, created on first use.
+    fn application(&mut self) -> Value {
+        if let Some(i) = self.services.get("__application") {
+            return Value::Ref(*i);
+        }
+        let i = self.new_holder("Landroid/app/Application;");
+        self.services.insert("__application".into(), i);
+        Value::Ref(i)
+    }
+
+    /// A named system service. One object per name, process-wide.
+    fn service(&mut self, descriptor: &str) -> Value {
+        let key = format!("svc:{descriptor}");
+        if let Some(i) = self.services.get(&key) {
+            return Value::Ref(*i);
+        }
+        let i = self.new_holder(descriptor);
+        self.services.insert(key, i);
+        Value::Ref(i)
+    }
+
+    /// `getSystemService` takes a *name* like "layout_inflater" but callers
+    /// then call methods on it, so it needs a class descriptor.
+    fn service_descriptor(&mut self, name: &str) -> u32 {
+        match name {
+            "layout_inflater" | "window" => self.service("Landroid/view/LayoutInflater;").as_ref(),
+            "activity_manager" | "window_manager" => {
+                self.service("Landroid/app/ActivityManager;").as_ref()
+            }
+            "notification" => self.service("Landroid/app/NotificationManager;").as_ref(),
+            "uimode" => self.service("Landroid/app/UiModeManager;").as_ref(),
+            "accessibility" => self.service("Landroid/accessibilityservice/AccessibilityService;").as_ref(),
+            "" => 0,
+            other => self.service(&format!("Landroid/system/{other};")).as_ref(),
+        }
     }
 
     /// Allocate a mutable single-value cell (boxed values, atomics).
@@ -1261,6 +1303,24 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
                 let l = self.new_holder("Landroidx/compose/runtime/internal/ComposableLambda;");
                 Value::Ref(l)
             }
+            // android.content.Context. These have no real answer without a
+            // system server, but stable non-null placeholders keep callers off
+            // their own null paths.
+            _ if class.ends_with("Context") || class.ends_with("Activity") => match name {
+                "getApplicationContext" | "getApplication" => self.application(),
+                "getResources" => self.service("Landroid/content/res/Resources;"),
+                "getSystemService" => {
+                    let n = args
+                        .get(1)
+                        .map(|v| v.as_ref())
+                        .and_then(|i| self.heap.get(i as usize))
+                        .and_then(|o| o.string.clone())
+                        .unwrap_or_default();
+                    Value::Ref(self.service_descriptor(&n))
+                }
+                "getPackageName" => Value::Ref(self.new_string("org.fdroid")),
+                _ => return None,
+            },
             // Kotlin's lateinit guard. The getter compiles to
             //   sfield; if-eqz -> throwUninitializedProperty
             // so the read already happened by the time we're called; returning
