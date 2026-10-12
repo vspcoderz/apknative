@@ -1694,6 +1694,16 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             {
                 Value::Void
             }
+            // SnapshotKt.readable/writable decide whether a state may be read
+            // under the current snapshot, and throw KotlinNothingValueException
+            // when it may not. With no snapshot system there is never a valid
+            // snapshot, so every state read fails and the composition dies at
+            // the first one. Passing the record straight back is what these
+            // return on the happy path.
+            (
+                "androidx/compose/runtime/snapshots/SnapshotKt",
+                "readable" | "writable",
+            ) => args.first().cloned().unwrap_or(Value::Ref(0)),
             // Compose's snapshot consistency checks. These only run when the
             // snapshot machinery is unhappy -- a state being read outside a
             // valid snapshot -- and there is no snapshot here to be unhappy
