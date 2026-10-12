@@ -175,6 +175,8 @@ pub struct Runtime {
     /// something records it, a composition runs to completion and leaves no
     /// evidence it happened at all.
     pub node_log: Vec<String>,
+    /// The recording Applier handed to Composer.getApplier().
+    pub applier: u32,
     pub system_out: u32,
     /// System services are singletons per process: an app routinely asks for
     /// the same service twice and compares the results. Keyed by name so each
@@ -197,6 +199,7 @@ impl Runtime {
             statics: HashMap::new(),
             activity: 0,
             node_log: Vec::new(),
+            applier: 0,
             system_out: 0,
             services: HashMap::new(),
             empty: 0,
@@ -310,6 +313,7 @@ impl Runtime {
         };
 
         let composer = self.new_holder("Landroidx/compose/runtime/Composer;");
+        self.applier = self.new_holder("Landroidx/compose/runtime/Applier;");
         let saved = self.cur;
         self.cur = dexid;
 
@@ -378,6 +382,34 @@ impl Runtime {
     /// comes back null.
     ///
     /// Groups nest, so entering one saves the cursor and leaving restores it.
+    /// The class name of an allocated object. A type index only means
+    /// something alongside the DEX it came from.
+    /// How many nodes are currently open, taken from the indentation
+    /// already recorded rather than tracked separately.
+    fn open_nodes(&self) -> usize {
+        self.node_log
+            .iter()
+            .rev()
+            .take_while(|l| !l.contains("(end)"))
+            .filter(|l| {
+                !l.ends_with('>') && !l.ends_with('<') && !l.contains("(end)")
+            })
+            .count()
+    }
+
+    /// The class name of an allocated object. A type index only means
+    /// something alongside the DEX it came from.
+    fn object_class(&self, r: u32) -> String {
+        let Some(o) = self.heap.get(r as usize) else {
+            return "?".into();
+        };
+        if o.class_idx == NO_INDEX {
+            return "?".into();
+        }
+        let dexid = if o.dex < self.dexes.len() { o.dex } else { 0 };
+        self.dexes[dexid].class_name(o.class_idx as TypeIdx).to_string()
+    }
+
     fn slot_push(&mut self, c: u32) {
         let idx = self.ensure_cell(c, "Landroidx/compose/runtime/Composer;");
         let cur = self.heap[idx as usize].value.clone().unwrap_or(Value::Int(0)).as_int();
@@ -1831,6 +1863,31 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             // deliberate degradation: the applier we do have records what was
             // emitted, which is the point of running this far.
             ("androidx/compose/runtime/ComposablesKt", "invalidApplier") => Value::Void,
+            // The node emission API. This is where a composable says "I am
+            // emitting a node"; without it a composition builds its theme and
+            // its Surface and then quietly stops, having emitted nothing.
+            ("androidx/compose/runtime/Composer", "getApplier") => Value::Ref(self.applier),
+            ("androidx/compose/runtime/Composer", "useNode" | "useNodeUnmodified") => {
+                let depth = self.open_nodes();
+                let kind = args
+                    .get(1)
+                    .map(|v| self.object_class(v.as_ref()))
+                    .unwrap_or_else(|| "?".into());
+                let short = kind.rsplit('/').next().unwrap_or("?").to_string();
+                self.node_log
+                    .push(format!("{}{short}", "  ".repeat(depth)));
+                Value::Void
+            }
+            ("androidx/compose/runtime/Composer", "startReusableNode") => {
+                let depth = self.open_nodes();
+                self.node_log.push(format!("{}(reusable", "  ".repeat(depth)));
+                Value::Void
+            }
+            ("androidx/compose/runtime/Composer", "endNode") => {
+                let depth = self.open_nodes();
+                self.node_log.push(format!("{}(end)", "  ".repeat(depth)));
+                Value::Void
+            }
             // Applier is how the Composer is told what was emitted. The base
             // class throws invalidApplier() from beginNode, which is how a
             // composition dies once it actually reaches a node -- so the
