@@ -22,15 +22,20 @@ apknative verify app.apk           # static-check all bytecode
 | Binary XML / `AndroidManifest.xml` | working |
 | Launcher-activity resolution (incl. aliases, `enabled=false`) | working |
 | Multidex class location | working |
-| Dalvik interpreter (~70 opcodes) | working |
+| Dalvik interpreter (int, long, float, double) | working |
 | Activity lifecycle (`onCreate`/`onStart`/`onResume`) | working |
 | Static bytecode verifier | working |
 | `java.util` collections, iterators, boxing | working |
-| Jetpack Compose rendering | not started — the hard limit |
+| Compose composition (slot table, CompositionLocals, snapshots) | running |
+| Compose rendering (node capture → measure → layout → raster) | not started |
 | Android framework shims | partial |
 
+A Compose app's screen composable now runs to completion without throwing.
+F-Droid's `MainContent` executes; it emits into a Composer that records
+nothing, so there is no tree to draw yet. See `PLAN.md` for the stages.
+
 The test suite compiles Java, dexes it with Google's own `d8`, runs each program
-on the real JVM and on `apknative`, and diffs the output. All four cases are
+on the real JVM and on `apknative`, and diffs the output. All five cases are
 byte-identical:
 
 ```
@@ -39,7 +44,8 @@ PASS  Hello      # recursion, loops, StringBuilder, arrays, long arithmetic
 PASS  Lit        # string concatenation
 PASS  W
 PASS  X
-=== 4 passed, 0 failed ===
+PASS  Refs       # null checks, identity, interface dispatch
+=== 5 passed, 0 failed ===
 ```
 
 ## What actually runs

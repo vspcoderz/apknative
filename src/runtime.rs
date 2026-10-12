@@ -171,6 +171,10 @@ pub struct Runtime {
     /// LifecycleOwner, SavedStateRegistryOwner and Context, so the locals
     /// that name those things resolve to it.
     pub activity: u32,
+    /// The emitted node tree, as a flat begin/end log. This is the UI: until
+    /// something records it, a composition runs to completion and leaves no
+    /// evidence it happened at all.
+    pub node_log: Vec<String>,
     pub system_out: u32,
     /// System services are singletons per process: an app routinely asks for
     /// the same service twice and compares the results. Keyed by name so each
@@ -192,6 +196,7 @@ impl Runtime {
             heap: Vec::new(),
             statics: HashMap::new(),
             activity: 0,
+            node_log: Vec::new(),
             system_out: 0,
             services: HashMap::new(),
             empty: 0,
@@ -321,6 +326,13 @@ impl Runtime {
 
         if let Err(e) = &r {
             eprintln!("apknative: composable failed: {e}");
+        }
+        if !self.node_log.is_empty() {
+            let nodes = self.node_log.iter().filter(|l| l.ends_with(">")).count();
+            eprintln!("apknative: emitted {nodes} nodes ({} events)", self.node_log.len());
+            for line in self.node_log.iter().take(80) {
+                eprintln!("  {line}");
+            }
         }
         Some(r.unwrap_or(Value::Void))
     }
@@ -1812,6 +1824,51 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             {
                 Value::Int(3)
             }
+            // ComposeUiNode checks that the Composer's applier can accept the
+            // node it was handed, and calls this when it cannot. Our Composer
+            // has no applier field at all, so the check always fails and the
+            // composition dies on its first node. Letting it pass is the
+            // deliberate degradation: the applier we do have records what was
+            // emitted, which is the point of running this far.
+            ("androidx/compose/runtime/ComposablesKt", "invalidApplier") => Value::Void,
+            // Applier is how the Composer is told what was emitted. The base
+            // class throws invalidApplier() from beginNode, which is how a
+            // composition dies once it actually reaches a node -- so the
+            // default applier has to exist and record.
+            ("androidx/compose/runtime/Applier", "beginNode") => {
+                let depth = self.node_log.iter().filter(|l| l.ends_with(">")).count();
+                let pad = "  ".repeat(depth);
+                self.node_log.push(format!("{pad}>"));
+                Value::Void
+            }
+            ("androidx/compose/runtime/Applier", "endNode") => {
+                if self.node_log.last().map(|l| l.ends_with(">")) == Some(true) {
+                    self.node_log.pop();
+                }
+                let depth = self.node_log.iter().filter(|l| l.ends_with(">")).count();
+                self.node_log.push(format!("{}<", "  ".repeat(depth)));
+                Value::Void
+            }
+            // The rest of Applier is the mutation protocol. Nothing mutates
+            // the tree here -- this is one composition, recorded once.
+            _ if class == "androidx/compose/runtime/Applier" => Value::Void,
+            // ScatterMap.get probes with a slot index masked by _capacity. On
+            // a real map that terminates; invoked on a null receiver the
+            // capacity reads 0, the index never advances and the lookup spins
+            // until the step budget runs out -- a hang, not a crash, which is
+            // the worst kind to diagnose.
+            //
+            // The receiver is null because our Composer is a bare holder with
+            // no fields, so every field Compose reads off it is null too. A
+            // lookup against no map has no entry, so null is the truthful
+            // answer. Anything that genuinely needs the map wants a Recomposer
+            // and a Composition, which is the next subsystem.
+            _ if class == "androidx/collection/ScatterMap"
+                && matches!(name, "get" | "getOrDefault")
+                && args.first().map(|v| v.as_ref()) == Some(0) =>
+            {
+                Value::Ref(0)
+            }
             // Compose's snapshot consistency checks. These only run when the
             // snapshot machinery is unhappy -- a state being read outside a
             // valid snapshot -- and there is no snapshot here to be unhappy
@@ -2205,6 +2262,81 @@ fn obj(&self, r: u32) -> Option<&Object> {
         }
 
         if class == "java/lang/Integer" || class == "java/lang/Long" {
+            // The bit-twiddling statics. ScatterMap's probe step is one of
+            // these: the slot index advances by the number of trailing zero
+            // bits in a metadata word, and a result of zero there leaves the
+            // index where it was, so the probe never moves and the lookup
+            // spins forever. They were missing entirely.
+            match name.as_str() {
+                "numberOfTrailingZeros" => {
+                    let v = args.first().map(|v| v.as_long()).unwrap_or(0);
+                    let n = if class == "java/lang/Long" {
+                        (v as u64).trailing_zeros()
+                    } else {
+                        (v as u32).trailing_zeros()
+                    };
+                    return Ok(Value::Int(n as i32));
+                }
+                "numberOfLeadingZeros" => {
+                    let v = args.first().map(|v| v.as_long()).unwrap_or(0);
+                    let n = if class == "java/lang/Long" {
+                        (v as u64).leading_zeros()
+                    } else {
+                        (v as u32).leading_zeros()
+                    };
+                    return Ok(Value::Int(n as i32));
+                }
+                "bitCount" => {
+                    let v = args.first().map(|v| v.as_long()).unwrap_or(0);
+                    let n = if class == "java/lang/Long" {
+                        (v as u64).count_ones()
+                    } else {
+                        (v as u32).count_ones()
+                    };
+                    return Ok(Value::Int(n as i32));
+                }
+                "lowestOneBit" => {
+                    let v = args.first().map(|v| v.as_long()).unwrap_or(0);
+                    return Ok(Value::Long(v & v.wrapping_neg()));
+                }
+                "highestOneBit" => {
+                    let v = args.first().map(|v| v.as_long()).unwrap_or(0);
+                    let b: i64 = if class == "java/lang/Long" {
+                        let n = (63 - (v as u64).leading_zeros() as i64).max(0).min(63);
+                        1i64 << n
+                    } else {
+                        let n = (31 - (v as u32).leading_zeros() as i32).max(0).min(31);
+                        (1i32 << n) as i64
+                    };
+                    return Ok(Value::Long(b));
+                }
+                "rotateLeft" | "rotateRight" => {
+                    let v = args.first().map(|v| v.as_long()).unwrap_or(0);
+                    let d = args.get(1).map(|v| v.as_int()).unwrap_or(0) as u32;
+                    let wide = class == "java/lang/Long";
+                    let r = if wide {
+                        let x = v as u64;
+                        let n = d % 64;
+                        let r = if name == "rotateLeft" {
+                            x.rotate_left(n)
+                        } else {
+                            x.rotate_right(n)
+                        };
+                        r as i64
+                    } else {
+                        let x = v as u32;
+                        let n = d % 32;
+                        let r = if name == "rotateLeft" {
+                            x.rotate_left(n)
+                        } else {
+                            x.rotate_right(n)
+                        };
+                        r as i64
+                    };
+                    return Ok(Value::Long(r));
+                }
+                _ => {}
+            }
             match name.as_str() {
                 "parseInt" | "parseLong" => {
                     let s = self
