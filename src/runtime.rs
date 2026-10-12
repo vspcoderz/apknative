@@ -2258,6 +2258,72 @@ fn obj(&self, r: u32) -> Option<&Object> {
         // State.getValue(). Every MutableState keeps its value in a field
         // called `value`; reading it directly is both simpler and more correct
         // than reimplementing the snapshot machinery.
+        // android.view.View and its relatives. There is no window and nothing
+        // to draw, but these are called by AppCompat and EdgeToEdge on every
+        // Activity's way up, and returning null there sends startup down
+        // failure paths that have nothing to do with what we are testing.
+        // The objects are inert and consistent: one Window per Activity, one
+        // decor View under it, and a child list that behaves like a list.
+        if class == "android/view/Window" {
+            match name.as_str() {
+                "getDecorView" => {
+                    let r = args.first().map(|v| v.as_ref()).unwrap_or(0);
+                    let idx = self.ensure_holder(r, &class);
+                    if let Some(e) = self.heap[idx as usize].elems.as_ref() {
+                        if let Some(first) = e.first() {
+                            return Ok(first.clone());
+                        }
+                    }
+                    let v = self.new_holder("Landroid/view/View;");
+                    self.heap[idx as usize].elems = Some(vec![Value::Ref(v)]);
+                    return Ok(Value::Ref(v));
+                }
+                "addFlags" | "clearFlags" | "setStatusBarColor" | "setNavigationBarColor"
+                | "setStatusBarColorLongLived" | "setDecorFitsSystemWindows"
+                | "setNavigationBarContrastEnforced" => return Ok(Value::Void),
+                "getAttributes" => {
+                    return Ok(self.service("Landroid/view/WindowManager$LayoutParams;"));
+                }
+                _ => return Ok(Value::Void),
+            }
+        }
+
+        if class == "android/view/ViewGroup" || class == "android/view/View" {
+            let recv = args.first().map(|v| v.as_ref()).unwrap_or(0);
+            let idx = self.ensure_holder(recv, &class);
+            if name == "addView" {
+                // addView(View) and addView(View, LayoutParams)
+                let child = args.get(1).cloned().unwrap_or(Value::Ref(0));
+                self.heap[idx as usize]
+                    .elems
+                    .get_or_insert_with(Vec::new)
+                    .push(child);
+                return Ok(Value::Void);
+            }
+            if name == "removeView" {
+                let child = args.get(1).map(|v| v.as_ref()).unwrap_or(0);
+                if let Some(e) = self.heap[idx as usize].elems.as_mut() {
+                    e.retain(|v| v.as_ref() != child);
+                }
+                return Ok(Value::Void);
+            }
+            return match name.as_str() {
+                "getChildCount" => Ok(Value::Int(
+                    self.heap[idx as usize].elems.as_ref().map(|e| e.len()).unwrap_or(0) as i32,
+                )),
+                "getChildAt" => Ok(self.heap[idx as usize]
+                    .elems
+                    .as_ref()
+                    .and_then(|e| e.get(args.get(1).map(|v| v.as_int()).unwrap_or(0) as usize))
+                    .cloned()
+                    .unwrap_or(Value::Ref(0))),
+                "getContext" => Ok(self.application()),
+                "getResources" => Ok(self.service("Landroid/content/res/Resources;")),
+                "getId" => Ok(Value::Int(0)),
+                _ => Ok(Value::Void),
+            };
+        }
+
         if class.ends_with("State") && name == "getValue" {
             let recv = args.first().map(|v| v.as_ref()).unwrap_or(0);
             if let Some(o) = self.heap.get(recv as usize) {
