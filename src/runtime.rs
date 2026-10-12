@@ -177,6 +177,8 @@ pub struct Runtime {
     pub node_log: Vec<String>,
     /// The recording Applier handed to Composer.getApplier().
     pub applier: u32,
+    /// A synthetic Thread. Compose keys snapshots and slot tables off it.
+    pub thread: u32,
     pub system_out: u32,
     /// System services are singletons per process: an app routinely asks for
     /// the same service twice and compares the results. Keyed by name so each
@@ -200,6 +202,7 @@ impl Runtime {
             activity: 0,
             node_log: Vec::new(),
             applier: 0,
+            thread: 0,
             system_out: 0,
             services: HashMap::new(),
             empty: 0,
@@ -314,6 +317,9 @@ impl Runtime {
 
         let composer = self.new_holder("Landroidx/compose/runtime/Composer;");
         self.applier = self.new_holder("Landroidx/compose/runtime/Applier;");
+        if self.thread == 0 {
+            self.thread = self.new_holder("Ljava/lang/Thread;");
+        }
         let saved = self.cur;
         self.cur = dexid;
 
@@ -2316,6 +2322,72 @@ fn obj(&self, r: u32) -> Option<&Object> {
                 }
                 _ => {}
             }
+        }
+
+        // Intrinsics.areEqual is Kotlin's null-safe == and the most-called
+        // thing in the missing list. Identity for references, bitwise
+        // otherwise, so 0 == 0.0 stays false.
+        if class.ends_with("kotlin.jvm.internal.Intrinsics") && name == "areEqual" {
+            let a = args.first().cloned().unwrap_or(Value::Ref(0));
+            let b = args.get(1).cloned().unwrap_or(Value::Ref(0));
+            let eq = match (&a, &b) {
+                (Value::Ref(x), Value::Ref(y)) => x == y,
+                (Value::Ref(x), _) | (_, Value::Ref(x)) => *x == 0,
+                _ => a.as_long() == b.as_long(),
+            };
+            return Ok(Value::Int(i32::from(eq)));
+        }
+
+        // One thread, always the same one. Compose keys snapshots and slot
+        // tables off it, and a stable identity is all they need.
+        if class == "java.lang.Thread" && name == "currentThread" {
+            return Ok(Value::Ref(self.thread));
+        }
+        if class == "java.lang.Thread" && (name == "getId" || name == "hashCode") {
+            return Ok(if name == "getId" {
+                Value::Long(1)
+            } else {
+                Value::Int(1)
+            });
+        }
+
+        // Unboxing: a boxed number read back out is the number.
+        if matches!(class.as_str(), "java.lang.Integer" | "java.lang.Long" | "java.lang.Float"
+                | "java.lang.Double" | "java.lang.Number" | "java.lang.Byte"
+                | "java.lang.Short" | "java.lang.Character")
+            && matches!(name.as_str(),
+                "intValue" | "longValue" | "floatValue" | "doubleValue")
+        {
+            let v = args.first().cloned().unwrap_or(Value::Int(0));
+            return Ok(match name.as_str() {
+                "longValue" => Value::Long(v.as_long()),
+                "floatValue" => Value::Float(v.as_f32()),
+                "doubleValue" => Value::Double(v.as_f64()),
+                _ => Value::Int(v.as_int()),
+            });
+        }
+        if class == "java.lang.Float" && name == "floatToRawIntBits" {
+            return Ok(Value::Int(
+                args.first().map(|v| v.as_f32()).unwrap_or(0.0).to_bits() as i32,
+            ));
+        }
+        if class == "java.lang.Float" && name == "compare" {
+            let a = args.first().map(|v| v.as_f32()).unwrap_or(0.0);
+            let b = args.get(1).map(|v| v.as_f32()).unwrap_or(0.0);
+            return Ok(Value::Int(if a < b { -1 } else if a > b { 1 } else { 0 }));
+        }
+        // A context plus another context is a context, and nothing here
+        // schedules anything, so the left-hand one is the whole answer.
+        if class.ends_with("kotlin.coroutines.CoroutineContext") && name == "plus" {
+            return Ok(args.first().cloned().unwrap_or(Value::Ref(0)));
+        }
+        // Wrapping a map changes nothing: there is one thread to be safe from.
+        if class == "java.util.Collections" && name == "synchronizedMap" {
+            return Ok(args.first().cloned().unwrap_or(Value::Ref(0)));
+        }
+        // Folding a modifier chain with no operation leaves it as it was.
+        if class == "androidx.compose.ui.Modifier" && name == "foldIn" {
+            return Ok(args.get(1).cloned().unwrap_or(Value::Ref(0)));
         }
 
         if class == "java/lang/Integer" || class == "java/lang/Long" {
