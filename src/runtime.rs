@@ -263,8 +263,18 @@ impl Runtime {
 
     /// Allocate a collection whose payload lives in `elems`.
     fn new_holder(&mut self, descriptor: &str) -> u32 {
-        let t = self.type_index_for(descriptor);
+        // Allocate against the DEX that actually defines the class, not the
+        // one that happens to be running. A type index means nothing outside
+        // its own file, so a holder built for a class in another DEX ends up
+        // with an index that names something else entirely -- which is why
+        // the emitted node log came back reading "?" for every node.
+        let (dexid, t) = self
+            .resolve_class_any(descriptor)
+            .unwrap_or_else(|| (self.cur, self.type_index_for(descriptor)));
+        let saved = self.cur;
+        self.cur = dexid;
         let idx = self.alloc(t);
+        self.cur = saved;
         self.heap[idx as usize].elems = Some(Vec::new());
         idx
     }
