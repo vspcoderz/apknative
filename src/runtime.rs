@@ -1694,6 +1694,16 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             {
                 Value::Void
             }
+            // Compose's snapshot consistency checks. These only run when the
+            // snapshot machinery is unhappy -- a state being read outside a
+            // valid snapshot -- and there is no snapshot here to be unhappy
+            // about. Left to run, the first one aborts the composition with an
+            // IllegalStateException that says nothing we can act on.
+            _ if class.starts_with("androidx/compose/runtime/snapshots/SnapshotKt")
+                && name.ends_with("Error") =>
+            {
+                Value::Void
+            }
             // An inline value class is mangled with a dash; this one packs
             // the window's width and height as two floats. A window that does
             // not exist has no size, and zero is what an absent one means.
