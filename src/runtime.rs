@@ -659,7 +659,22 @@ pub fn has_class(&self, name: &str) -> bool {
 
         let result = match self.lookup(dex_id, class_idx, &mname, Some(&sig)) {
             Some((d, enc, m)) => self.exec_resolved(d, enc, m, args, depth),
-            None => self.builtin(method_idx, args),
+            // A method_id names a class that need not be *defined* in the same
+            // file. A static call across DEX boundaries is routine -- an
+            // Activity in classes2.dex calling into a UI class in classes.dex
+            // -- and the index alone cannot tell us that, so ask by descriptor
+            // when the local file has nothing.
+            None => {
+                // class_name is dotted; resolve_class_any wants a descriptor.
+                let desc = Self::descriptor(&self.d().class_name(class_idx));
+                match self
+                    .resolve_class_any(&desc)
+                    .and_then(|(d2, t2)| self.lookup(d2, t2, &mname, Some(&sig)))
+                {
+                    Some((d, enc, m)) => self.exec_resolved(d, enc, m, args, depth),
+                    None => self.builtin(method_idx, args),
+                }
+            }
         };
         self.cur = saved;
         result
@@ -1172,14 +1187,28 @@ pub fn has_class(&self, name: &str) -> bool {
                 // if-<cond>z vAA, +BBBB   (21t)
                 0x38..=0x3d => {
                     let off = insns[pc + 1] as i16 as i32;
-                    let x = reg!(aa).as_long();
-                    let take = match op {
-                        0x38 => x == 0,
-                        0x39 => x != 0,
-                        0x3a => x < 0,
-                        0x3b => x >= 0,
-                        0x3c => x > 0,
-                        _ => x <= 0,
+                    let v = reg!(aa);
+                    // A reference is tested for null, not coerced to a number.
+                    // Coercion returns 0 for every object, so `if (x != null)`
+                    // was always taken -- which made non-null objects behave
+                    // as null everywhere, and is invisible until an app
+                    // asserts on the difference.
+                    let take = match &v {
+                        Value::Ref(r) => match op {
+                            0x38 => *r == 0,
+                            _ => *r != 0,
+                        },
+                        _ => {
+                            let x = v.as_long();
+                            match op {
+                                0x38 => x == 0,
+                                0x39 => x != 0,
+                                0x3a => x < 0,
+                                0x3b => x >= 0,
+                                0x3c => x > 0,
+                                _ => x <= 0,
+                            }
+                        }
                     };
                     if take {
                         next = (pc as i32 + off) as usize;
@@ -1500,8 +1529,27 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
                     Value::Ref(self.service_descriptor(&n))
                 }
                 "getPackageName" => Value::Ref(self.new_string("org.fdroid")),
+                // ComponentActivity's constructor null-checks these before it
+                // stores them, so returning null aborts startup with a
+                // NullPointerException rather than anything useful. Keyed per
+                // class so two Activities do not share one instance.
+                "getLifecycle" | "getViewModelStore" | "getSavedStateRegistryOwner"
+                | "getOnBackPressedDispatcher" => {
+                    self.service(&format!("L{class};$member;"))
+                }
                 _ => return None,
             },
+            // R8 outlines `checkNotNull` into a synthetic single-call helper
+            // that reports the failure and then throws null. These guard
+            // framework state we deliberately do not model -- ComponentActivity
+            // asserting its own Lifecycle exists, for instance -- so failing
+            // them tells us nothing we can act on and only aborts startup.
+            // Matched on the shape R8 guarantees, not on one app's name.
+            _ if class.contains("ExternalSyntheticBUOutline")
+                && matches!(name, "m" | "m0" | "$$m" | "lambda$") =>
+            {
+                Value::Void
+            }
             // Kotlin's lateinit guard. The getter compiles to
             //   sfield; if-eqz -> throwUninitializedProperty
             // so the read already happened by the time we're called; returning
@@ -2225,7 +2273,17 @@ fn obj(&self, r: u32) -> Option<&Object> {
                     let i = self.new_holder("Landroid/content/Intent;");
                     return Ok(Value::Ref(i));
                 }
-                "isFinishing" | "isDestroyed" => return Ok(Value::Int(0)),
+                "getPackageName" => {
+                    return Ok(Value::Ref(self.new_string("org.fdroid")));
+                }
+                // ComponentActivity's constructor null-checks the result of
+                // this before storing it, so returning null aborts startup
+                // with a NullPointerException rather than anything useful.
+                // The name is per-class so two Activities do not share one.
+                "getLifecycle" | "getViewModelStore" | "getSavedStateRegistryOwner"
+                | "getOnBackPressedDispatcher" => {
+                    return Ok(self.service(&format!("L{class};$member;")));
+                }
                 _ => {}
             }
         }
