@@ -8,6 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const MAX_DEPTH: usize = 2000;
 const NO_INDEX: u32 = 0xffff_ffff;
 
+/// How many saved cursors sit at the front of a Composer's slot vector. They
+/// are a run of Ints and slots hold references, so the two never collide.
+fn stack_depth(stack: &[Value]) -> usize {
+    stack.iter().take_while(|v| matches!(v, Value::Int(_))).count()
+}
+
 /// Instructions executed so far, across every call frame.
 static STEPS: AtomicU64 = AtomicU64::new(0);
 
@@ -322,6 +328,57 @@ impl Runtime {
             .iter()
             .position(|f| f.class as u32 == class && dex.string(f.name) == name)
             .map(|i| i as FieldIdx)
+    }
+
+    /// Compose's slot table. A `remember` reads the current slot and writes
+    /// back the new value, so a Composer that answers every read with null can
+    /// never remember anything -- and every value a composable depends on,
+    /// including the ViewModelStoreOwner the Activity is supposed to provide,
+    /// comes back null.
+    ///
+    /// Groups nest, so entering one saves the cursor and leaving restores it.
+    fn slot_push(&mut self, c: u32) {
+        let idx = self.ensure_cell(c, "Landroidx/compose/runtime/Composer;");
+        let cur = self.heap[idx as usize].value.clone().unwrap_or(Value::Int(0)).as_int();
+        let mut stack = self.heap[idx as usize].elems.take().unwrap_or_default();
+        // The slot values and the saved cursors share the vector, with the
+        // cursors on the front.
+        stack.insert(0, Value::Int(cur));
+        self.heap[idx as usize].elems = Some(stack);
+    }
+
+    fn slot_pop(&mut self, c: u32) {
+        let Some(o) = self.heap.get(c as usize) else { return };
+        let Some(mut stack) = o.elems.clone() else { return };
+        if stack.is_empty() {
+            return;
+        }
+        let cur = stack.remove(0).as_int();
+        self.heap[c as usize].elems = Some(stack);
+        self.heap[c as usize].value = Some(Value::Int(cur));
+    }
+
+    /// Current slot's value without moving on.
+    fn slot_peek(&mut self, c: u32) -> Value {
+        let idx = self.ensure_cell(c, "Landroidx/compose/runtime/Composer;");
+        let cur = self.heap[idx as usize].value.clone().unwrap_or(Value::Int(0)).as_int();
+        let stack = self.heap[idx as usize].elems.clone().unwrap_or_default();
+        // Slot values live past the saved cursors.
+        stack.get(cur as usize + stack_depth(&stack)).cloned().unwrap_or(Value::Ref(0))
+    }
+
+    /// Write the current slot and move to the next one.
+    fn slot_write(&mut self, c: u32, v: Value) {
+        let idx = self.ensure_cell(c, "Landroidx/compose/runtime/Composer;");
+        let cur = self.heap[idx as usize].value.clone().unwrap_or(Value::Int(0)).as_int();
+        let mut stack = self.heap[idx as usize].elems.take().unwrap_or_default();
+        let depth = stack_depth(&stack);
+        while stack.len() <= depth + cur as usize {
+            stack.push(Value::Ref(0));
+        }
+        stack[depth + cur as usize] = v;
+        self.heap[idx as usize].elems = Some(stack);
+        self.heap[idx as usize].value = Some(Value::Int(cur + 1));
     }
 
     /// The process-wide Application object, created on first use.
@@ -1336,6 +1393,12 @@ fn switch_payload(insns: &[u16], pc: usize) -> Option<usize> {
     None
 }
 
+/// How many saved cursors sit at the front of a Composer's slot vector. They
+/// are a run of Ints, and slots hold references, so the two never collide.
+fn stack_depth(stack: &[Value]) -> usize {
+    stack.iter().take_while(|v| matches!(v, Value::Int(_))).count()
+}
+
 fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
         if is_long {
             let a = x.as_long();
@@ -1488,24 +1551,44 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             (
                 "androidx/compose/runtime/Composer",
                 "startRestartGroup" | "startReplaceableGroup" | "startRestartGroupPassingParams",
-            ) => args.first().cloned().unwrap_or(Value::Ref(0)),
+            ) => {
+                let c = args.first().map(|v| v.as_ref()).unwrap_or(0);
+                self.slot_push(c);
+                args.first().cloned().unwrap_or(Value::Ref(0))
+            }
             (
                 "androidx/compose/runtime/Composer",
                 "endRestartGroup" | "endReplaceableGroup" | "endRestartGroupPassingParams",
-            ) => Value::Ref(self.new_holder("Landroidx/compose/runtime/internal/ScopeUpdateScope;")),
+            ) => {
+                let c = args.first().map(|v| v.as_ref()).unwrap_or(0);
+                self.slot_pop(c);
+                Value::Ref(self.new_holder("Landroidx/compose/runtime/internal/ScopeUpdateScope;"))
+            }
             // A first composition compares against an empty slot table, so
-            // nothing has changed. Reporting true would send the runtime down
-            // the invalidate path instead of running the block.
-            ("androidx/compose/runtime/Composer", "changed" | "changedInstance") => Value::Int(0),
+            // nothing has changed; afterwards this is a real comparison
+            // against what was remembered.
+            ("androidx/compose/runtime/Composer", "changed" | "changedInstance") => {
+                let c = args.first().map(|v| v.as_ref()).unwrap_or(0);
+                let have = self.slot_peek(c);
+                let want = args.get(1).cloned().unwrap_or(Value::Ref(0));
+                return Some(Value::Int(i32::from(have != want)));
+            }
             // The gate every composable opens with. Answering false makes the
             // body skip itself entirely, which is why the tree came out empty.
             ("androidx/compose/runtime/Composer", "shouldExecute") => Value::Int(1),
-            // `remember` reads a slot then writes back the new value. With no
-            // slot table every read is empty, which for a single composition
-            // means the value is never restored -- correct enough to render
-            // once, wrong for anything that recomposes.
-            ("androidx/compose/runtime/Composer", "rememberedValue") => Value::Ref(0),
-            ("androidx/compose/runtime/Composer", "updateRememberedValue") => Value::Void,
+            // `remember` reads the current slot then writes the new value
+            // back and moves on. Answering reads with a constant null, as this
+            // used to, means nothing is ever remembered.
+            ("androidx/compose/runtime/Composer", "rememberedValue") => {
+                let c = args.first().map(|v| v.as_ref()).unwrap_or(0);
+                return Some(self.slot_peek(c));
+            }
+            ("androidx/compose/runtime/Composer", "updateRememberedValue") => {
+                let c = args.first().map(|v| v.as_ref()).unwrap_or(0);
+                let v = args.get(1).cloned().unwrap_or(Value::Ref(0));
+                self.slot_write(c, v);
+                return Some(Value::Void);
+            }
             ("androidx/compose/runtime/Composer$Companion", "getEmpty") => {
                 Value::Ref(self.new_holder("Ljava/lang/Object;"))
             }
