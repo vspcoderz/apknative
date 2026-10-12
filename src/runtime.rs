@@ -149,6 +149,10 @@ pub struct Runtime {
     cur: usize,
     pub heap: Vec<Object>,
     pub statics: HashMap<FieldIdx, Value>,
+    /// The Activity being driven. It is its own ViewModelStoreOwner,
+    /// LifecycleOwner, SavedStateRegistryOwner and Context, so the locals
+    /// that name those things resolve to it.
+    pub activity: u32,
     pub system_out: u32,
     /// System services are singletons per process: an app routinely asks for
     /// the same service twice and compares the results. Keyed by name so each
@@ -169,6 +173,7 @@ impl Runtime {
             cur: 0,
             heap: Vec::new(),
             statics: HashMap::new(),
+            activity: 0,
             system_out: 0,
             services: HashMap::new(),
             empty: 0,
@@ -559,6 +564,7 @@ pub fn run_activity(&mut self, class_name: &str) -> Result<(), String> {
 
     // Allocate the Activity instance, then run its constructor and onCreate.
     let obj = self.alloc(type_idx);
+    self.activity = obj;
 
     // Run the superclass constructor first, as the runtime would.
     if let Some((d, enc, m)) = self.lookup(self.cur, type_idx, "<init>", None) {
@@ -1620,6 +1626,23 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             ("androidx/compose/runtime/Composer", "getApplyCoroutineContext") => {
                 Value::Ref(self.new_holder("Lkotlin/coroutines/CoroutineContext;"))
             }
+            // ComponentActivity.setContent provides these before the content
+            // runs: the Activity is its own ViewModelStoreOwner,
+            // LifecycleOwner, SavedStateRegistryOwner and Context. We invoke
+            // the content lambda directly instead, so nothing ever provides
+            // them and every read of one comes back null. That is how F-Droid
+            // ended up failing a null check on its ViewModelStoreOwner and
+            // abandoning the screen before emitting anything.
+            _ if name == "getCurrent"
+                && self.activity != 0
+                && (class.contains("LocalViewModelStoreOwner")
+                    || class.contains("LocalLifecycleOwner")
+                    || class.contains("LocalSavedStateRegistryOwner")
+                    || class.ends_with("platform/LocalContext")
+                    || class.ends_with("platform/LocalActivity")) =>
+            {
+                Value::Ref(self.activity)
+            }
             // The provided value for a CompositionLocal. With no provider in
             // the tree the local itself is the closest truthful answer, and it
             // keeps callers off their null checks.
@@ -1704,6 +1727,14 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
                 "androidx/compose/runtime/snapshots/SnapshotKt",
                 "readable" | "writable",
             ) => args.first().cloned().unwrap_or(Value::Ref(0)),
+            // Snapshot.setWriteCount$runtime compares the write count against
+            // the one the snapshot recorded when it was opened and throws when
+            // they differ. With writes happening outside any snapshot there is
+            // no recorded count to match, so this always throws and takes the
+            // composition with it. There is no concurrent writer to detect.
+            _ if class.contains("runtime/snapshots/Snapshot") && name == "setWriteCount$runtime" => {
+                Value::Void
+            }
             // Compose's snapshot consistency checks. These only run when the
             // snapshot machinery is unhappy -- a state being read outside a
             // valid snapshot -- and there is no snapshot here to be unhappy
