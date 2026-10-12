@@ -106,6 +106,24 @@ impl Value {
             Value::Void => 0,
         }
     }
+    pub fn as_f32(&self) -> f32 {
+        match self {
+            Value::Int(i) => *i as f32,
+            Value::Long(l) => *l as f32,
+            Value::Float(f) => *f,
+            Value::Double(d) => *d as f32,
+            _ => 0.0,
+        }
+    }
+    pub fn as_f64(&self) -> f64 {
+        match self {
+            Value::Int(i) => *i as f64,
+            Value::Long(l) => *l as f64,
+            Value::Float(f) => *f as f64,
+            Value::Double(d) => *d,
+            _ => 0.0,
+        }
+    }
     pub fn as_long(&self) -> i64 {
         match self {
             Value::Int(i) => *i as i64,
@@ -1321,7 +1339,7 @@ pub fn has_class(&self, name: &str) -> bool {
                 }
 
                 // ---- integer arithmetic ----
-                0x90..=0xa5 | 0xb0..=0xc5 => {
+                0x90..=0xaf | 0xb0..=0xcf => {
                     // 3addr (23x) is vA = vB op vCC; 2addr (12x) is vA = vA op vB.
                     // The long variants sit at 0x9b-0xa5 and 0xbb-0xc5.
                     let (a, b, c, is_long) = if op >= 0xb0 {
@@ -1333,7 +1351,14 @@ pub fn has_class(&self, name: &str) -> bool {
                         let c = (insns[pc + 1] >> 8) as usize;
                         (aa, b, c, op >= 0x9b)
                     };
-                    let v = if op >= 0xb0 {
+                    // Float and double sit inside the ranges the int and long
+                    // tables claim, so they have to be picked off first:
+                    // 0xcb-0xcf would otherwise read as long 2addr.
+                    let v = if (0xc6..=0xcf).contains(&op) {
+                        self.arith_fp(op, reg!(a), reg!(b), op >= 0xcb)
+                    } else if (0xa6..=0xaf).contains(&op) {
+                        self.arith_fp(op, reg!(b), reg!(c), op >= 0xab)
+                    } else if op >= 0xb0 {
                         self.arith(op, reg!(a), reg!(b), is_long)
                     } else {
                         self.arith(op, reg!(b), reg!(c), is_long)
@@ -1395,6 +1420,18 @@ pub fn has_class(&self, name: &str) -> bool {
             0x8d => Value::Int(x.as_int() as i8 as i32),   // int-to-byte
             0x8e => Value::Int(x.as_int() as u16 as i32),  // int-to-char
             0x8f => Value::Int(x.as_int() as i16 as i32),  // int-to-short
+            0x7f => Value::Float(-x.as_f32()),             // neg-float
+            0x80 => Value::Double(-x.as_f64()),            // neg-double
+            0x82 => Value::Float(x.as_int() as f32),       // int-to-float
+            0x83 => Value::Double(x.as_int() as f64),      // int-to-double
+            0x85 => Value::Float(x.as_long() as f32),      // long-to-float
+            0x86 => Value::Double(x.as_long() as f64),     // long-to-double
+            0x87 => Value::Int(x.as_f32() as i32),         // float-to-int
+            0x88 => Value::Long(x.as_f32() as i64),        // float-to-long
+            0x89 => Value::Double(x.as_f32() as f64),      // float-to-double
+            0x8a => Value::Int(x.as_f64() as i32),         // double-to-int
+            0x8b => Value::Long(x.as_f64() as i64),        // double-to-long
+            0x8c => Value::Float(x.as_f64() as f32),       // double-to-float
             _ => x,
         }
     }
@@ -1417,6 +1454,36 @@ fn switch_payload(insns: &[u16], pc: usize) -> Option<usize> {
 /// are a run of Ints, and slots hold references, so the two never collide.
 fn stack_depth(stack: &[Value]) -> usize {
     stack.iter().take_while(|v| matches!(v, Value::Int(_))).count()
+}
+
+/// Float and double arithmetic. The 23x forms are 0xa6-0xaf and the 2addr
+/// forms 0xc6-0xcf, laid out identically: add, sub, mul, div, rem, floats
+/// first and doubles second. These sat outside the int/long tables entirely,
+/// so any expression that mixed in a float died on an unimplemented opcode.
+fn arith_fp(&self, op: u8, x: Value, y: Value, is_double: bool) -> Value {
+    if is_double {
+        let (a, b) = (x.as_f64(), y.as_f64());
+        let r = match op {
+            0xab | 0xcb => a + b,
+            0xac | 0xcc => a - b,
+            0xad | 0xcd => a * b,
+            0xae | 0xce => a / b,
+            0xaf | 0xcf => a % b,
+            _ => a,
+        };
+        Value::Double(r)
+    } else {
+        let (a, b) = (x.as_f32(), y.as_f32());
+        let r = match op {
+            0xa6 | 0xc6 => a + b,
+            0xa7 | 0xc7 => a - b,
+            0xa8 | 0xc8 => a * b,
+            0xa9 | 0xc9 => a / b,
+            0xaa | 0xca => a % b,
+            _ => a,
+        };
+        Value::Float(r)
+    }
 }
 
 fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
@@ -1734,6 +1801,16 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             // composition with it. There is no concurrent writer to detect.
             _ if class.contains("runtime/snapshots/Snapshot") && name == "setWriteCount$runtime" => {
                 Value::Void
+            }
+            // A ColorSpace we hand back is the default one, sRGB, which has
+            // three colour components. Left to run, getComponentCount reads a
+            // field off an object with nothing in it and reports a count that
+            // matches no colour, so Color() rejects every colour it is asked
+            // to build and the whole screen fails on its first paint.
+            _ if class.contains("ui/graphics/colorspace")
+                && name.starts_with("getComponentCount") =>
+            {
+                Value::Int(3)
             }
             // Compose's snapshot consistency checks. These only run when the
             // snapshot machinery is unhappy -- a state being read outside a
