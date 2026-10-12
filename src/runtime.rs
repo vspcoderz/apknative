@@ -1511,6 +1511,28 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
             }
             ("androidx/compose/runtime/ComposerKt", "isTraceInProgress") => Value::Int(0),
             ("androidx/compose/runtime/Composer", "skipToGroupEnd") => Value::Void,
+            // Replacement groups bracket content the runtime may skip. None is
+            // ever skipped here, so open and close them as no-ops -- but they
+            // still have to be accepted, or the composable aborts on a missing
+            // method rather than producing its nodes.
+            ("androidx/compose/runtime/Composer", "startReplaceGroup") => Value::Void,
+            ("androidx/compose/runtime/Composer", "endReplaceGroup") => Value::Void,
+            // Side effects run after composition applies. Running them during
+            // composition would call back into a tree that does not exist yet.
+            ("androidx/compose/runtime/Composer", "recordSideEffect") => Value::Void,
+            ("androidx/compose/runtime/Composer", "getCompositeKeyHashCode") => {
+                Value::Long(0)
+            }
+            ("androidx/compose/runtime/Composer", "getApplyCoroutineContext") => {
+                Value::Ref(self.new_holder("Lkotlin/coroutines/CoroutineContext;"))
+            }
+            // The provided value for a CompositionLocal. With no provider in
+            // the tree the local itself is the closest truthful answer, and it
+            // keeps callers off their null checks.
+            ("androidx/compose/runtime/Composer", "consume") => {
+                args.get(1).cloned().unwrap_or(Value::Ref(0))
+            }
+            ("androidx/compose/runtime/ScopeUpdateScope", "updateScope") => Value::Void,
             // A checkcast guard Kotlin emits before invoking a Function2 of a
             // known arity. Passing the object through is the whole job. The
             // arity is the second argument because this one is static, so the
@@ -1577,6 +1599,12 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
                 && matches!(name, "m" | "m0" | "$$m" | "lambda$") =>
             {
                 Value::Void
+            }
+            // An inline value class is mangled with a dash; this one packs
+            // the window's width and height as two floats. A window that does
+            // not exist has no size, and zero is what an absent one means.
+            _ if class.ends_with("WindowInfo") && name.starts_with("getContainerSize") => {
+                Value::Long(0)
             }
             // Kotlin's lateinit guard. The getter compiles to
             //   sfield; if-eqz -> throwUninitializedProperty
@@ -2227,6 +2255,24 @@ fn obj(&self, r: u32) -> Option<&Object> {
         // DEX bytecode ran and hit an Unsafe call we do not have -- means a
         // lock can never be taken, and the app spins in the retry loop
         // forever instead of failing.
+        // State.getValue(). Every MutableState keeps its value in a field
+        // called `value`; reading it directly is both simpler and more correct
+        // than reimplementing the snapshot machinery.
+        if class.ends_with("State") && name == "getValue" {
+            let recv = args.first().map(|v| v.as_ref()).unwrap_or(0);
+            if let Some(o) = self.heap.get(recv as usize) {
+                let (od, ci) = (o.dex, o.class_idx);
+                if let Some(fi) = self.field_index_in(od, ci, "value") {
+                    return Ok(self.heap[recv as usize]
+                        .fields
+                        .get(&fi)
+                        .cloned()
+                        .unwrap_or(Value::Ref(0)));
+                }
+            }
+            return Ok(args.first().map(|v| v.as_ref()).map(Value::Ref).unwrap_or(Value::Ref(0)));
+        }
+
         if class.contains("AtomicReference") {
             let recv = args.first().map(|v| v.as_ref()).unwrap_or(0);
             let idx = self.ensure_cell(recv, &class);
