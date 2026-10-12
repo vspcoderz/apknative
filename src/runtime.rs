@@ -3,9 +3,30 @@
 
 use crate::dex::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_DEPTH: usize = 2000;
 const NO_INDEX: u32 = 0xffff_ffff;
+
+/// Instructions executed so far, across every call frame.
+static STEPS: AtomicU64 = AtomicU64::new(0);
+
+/// Set `APKNATIVE_MAX_STEPS` to bound execution.
+///
+/// Any app with a frame loop -- Compose's recomposer, anything animating --
+/// never returns on its own, because there is no clock to advance it. That
+/// makes the process unkillable by any means short of SIGKILL, which is a
+/// bad way to end a run. The budget stops execution deterministically and says
+/// so, which is also what makes a hung app debuggable rather than mysterious.
+fn max_steps() -> u64 {
+    static M: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("APKNATIVE_MAX_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50_000_000)
+    })
+}
 
 /// Set `APKNATIVE_TRACE=1` to dump every executed instruction.
 fn tracing() -> bool {
@@ -805,6 +826,13 @@ pub fn has_class(&self, name: &str) -> bool {
         }
 
         while pc < insns.len() {
+            if STEPS.fetch_add(1, Ordering::Relaxed) >= max_steps() {
+                return Err(format!(
+                    "step budget exhausted ({}); the app is waiting on a frame \
+                     clock that does not exist",
+                    max_steps()
+                ));
+            }
             let unit = insns[pc];
             let op = (unit & 0xff) as u8;
             let aa = ((unit >> 8) & 0xff) as usize;
