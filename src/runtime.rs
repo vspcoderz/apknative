@@ -1389,7 +1389,7 @@ pub fn has_class(&self, name: &str) -> bool {
                 }
 
                 // ---- integer arithmetic ----
-                0x90..=0xaf | 0xb0..=0xcf => {
+                0x90..=0xcf => {
                     // 3addr (23x) is vA = vB op vCC; 2addr (12x) is vA = vA op vB.
                     // The long variants sit at 0x9b-0xa5 and 0xbb-0xc5.
                     let (a, b, c, is_long) = if op >= 0xb0 {
@@ -1498,12 +1498,6 @@ fn switch_payload(insns: &[u16], pc: usize) -> Option<usize> {
         }
     }
     None
-}
-
-/// How many saved cursors sit at the front of a Composer's slot vector. They
-/// are a run of Ints, and slots hold references, so the two never collide.
-fn stack_depth(stack: &[Value]) -> usize {
-    stack.iter().take_while(|v| matches!(v, Value::Int(_))).count()
 }
 
 /// Float and double arithmetic. The 23x forms are 0xa6-0xaf and the 2addr
@@ -2425,16 +2419,21 @@ fn obj(&self, r: u32) -> Option<&Object> {
                     return Ok(Value::Int(n as i32));
                 }
                 "lowestOneBit" => {
-                    let v = args.first().map(|v| v.as_long()).unwrap_or(0);
-                    return Ok(Value::Long(v & v.wrapping_neg()));
+                    // isolate_lowest_one is what this is called in std, and it
+                    // is still unstable, so spell it out.
+                    #[allow(clippy::manual_isolate_lowest_one)]
+                    {
+                        let v = args.first().map(|v| v.as_long()).unwrap_or(0);
+                        return Ok(Value::Long(v & v.wrapping_neg()));
+                    }
                 }
                 "highestOneBit" => {
                     let v = args.first().map(|v| v.as_long()).unwrap_or(0);
                     let b: i64 = if class == "java/lang/Long" {
-                        let n = (63 - (v as u64).leading_zeros() as i64).max(0).min(63);
+                        let n = (63 - (v as u64).leading_zeros() as i64).clamp(0, 63);
                         1i64 << n
                     } else {
-                        let n = (31 - (v as u32).leading_zeros() as i32).max(0).min(31);
+                        let n = (31 - (v as u32).leading_zeros() as i32).clamp(0, 31);
                         (1i32 << n) as i64
                     };
                     return Ok(Value::Long(b));
