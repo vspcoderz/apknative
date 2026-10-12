@@ -2221,6 +2221,45 @@ fn obj(&self, r: u32) -> Option<&Object> {
         }
 
         // Boxed primitives and atomics keep their payload in `value`.
+        // AtomicReference is a one-slot cell that other threads compare
+        // against, and Kotlin's lock acquisition is a compare-and-set retry
+        // loop. Returning false here -- which is what happened when the real
+        // DEX bytecode ran and hit an Unsafe call we do not have -- means a
+        // lock can never be taken, and the app spins in the retry loop
+        // forever instead of failing.
+        if class.contains("AtomicReference") {
+            let recv = args.first().map(|v| v.as_ref()).unwrap_or(0);
+            let idx = self.ensure_cell(recv, &class);
+            if self.heap[idx as usize].value.is_none() {
+                self.heap[idx as usize].value = Some(Value::Ref(0));
+            }
+            let cur = self.heap[idx as usize].value.clone().unwrap_or(Value::Ref(0));
+            match name.as_str() {
+                "get" => return Ok(cur),
+                "set" | "lazySet" => {
+                    self.heap[idx as usize].value = args.get(1).cloned();
+                    return Ok(Value::Void);
+                }
+                "getAndSet" => {
+                    self.heap[idx as usize].value = args.get(1).cloned();
+                    return Ok(cur);
+                }
+                "compareAndSet" | "weakCompareAndSet" => {
+                    let want = args.get(1).cloned().unwrap_or(Value::Ref(0));
+                    if cur == want {
+                        self.heap[idx as usize].value = args.get(2).cloned();
+                        return Ok(Value::Int(1));
+                    }
+                    return Ok(Value::Int(0));
+                }
+                "toString" => {
+                    let r = self.new_string(&self.describe(&cur));
+                    return Ok(Value::Ref(r));
+                }
+                _ => {}
+            }
+        }
+
         if class.contains("AtomicInteger") || class.contains("/Integer;") {
             let recv = args.first().map(|v| v.as_ref()).unwrap_or(0);
             match name.as_str() {
