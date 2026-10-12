@@ -154,6 +154,11 @@ pub struct Runtime {
     /// the same service twice and compares the results. Keyed by name so each
     /// service gets one stable object.
     pub services: HashMap<String, u32>,
+    /// Compose's `Empty` sentinel. A composable distinguishes "nothing
+    /// remembered yet" from any real value by comparing the slot against
+    /// this, so it has to be one object: a fresh one per call never compares
+    /// equal to itself and the value is never created.
+    empty: u32,
 }
 
 impl Runtime {
@@ -166,6 +171,7 @@ impl Runtime {
             statics: HashMap::new(),
             system_out: 0,
             services: HashMap::new(),
+            empty: 0,
         }
     }
 
@@ -364,7 +370,10 @@ impl Runtime {
         let cur = self.heap[idx as usize].value.clone().unwrap_or(Value::Int(0)).as_int();
         let stack = self.heap[idx as usize].elems.clone().unwrap_or_default();
         // Slot values live past the saved cursors.
-        stack.get(cur as usize + stack_depth(&stack)).cloned().unwrap_or(Value::Ref(0))
+        stack
+            .get(cur as usize + stack_depth(&stack))
+            .cloned()
+            .unwrap_or(Value::Ref(self.empty))
     }
 
     /// Write the current slot and move to the next one.
@@ -470,6 +479,11 @@ impl Runtime {
     /// Allocate the shimmed core objects and bind the static fields that point
     /// at them, so `getstatic System.out` resolves to a real object.
     fn boot(&mut self) {
+        // Must exist before any Composer does: a fresh slot reads as Empty,
+        // and Empty has to be the same object every time.
+        if self.empty == 0 {
+            self.empty = self.new_holder("Ljava/lang/Object;");
+        }
         self.system_out = self.alloc(self.type_index_for("Ljava/io/PrintStream;"));
         let out = Value::Ref(self.system_out);
         if let Some(f) = self.find_field("Ljava/lang/System;", "out") {
@@ -1565,14 +1579,11 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
                 Value::Ref(self.new_holder("Landroidx/compose/runtime/internal/ScopeUpdateScope;"))
             }
             // A first composition compares against an empty slot table, so
-            // nothing has changed; afterwards this is a real comparison
-            // against what was remembered.
-            ("androidx/compose/runtime/Composer", "changed" | "changedInstance") => {
-                let c = args.first().map(|v| v.as_ref()).unwrap_or(0);
-                let have = self.slot_peek(c);
-                let want = args.get(1).cloned().unwrap_or(Value::Ref(0));
-                return Some(Value::Int(i32::from(have != want)));
-            }
+            // nothing has changed. Reporting a real comparison looked more
+            // correct and went less far: a composable that decides it was
+            // invalidated then re-emits, and with no slot table to re-emit
+            // into it loses its place. Optimistic is the safe answer here.
+            ("androidx/compose/runtime/Composer", "changed" | "changedInstance") => Value::Int(0),
             // The gate every composable opens with. Answering false makes the
             // body skip itself entirely, which is why the tree came out empty.
             ("androidx/compose/runtime/Composer", "shouldExecute") => Value::Int(1),
@@ -1590,7 +1601,7 @@ fn arith(&self, op: u8, x: Value, y: Value, is_long: bool) -> Value {
                 return Some(Value::Void);
             }
             ("androidx/compose/runtime/Composer$Companion", "getEmpty") => {
-                Value::Ref(self.new_holder("Ljava/lang/Object;"))
+                Value::Ref(self.empty)
             }
             ("androidx/compose/runtime/ComposerKt", "isTraceInProgress") => Value::Int(0),
             ("androidx/compose/runtime/Composer", "skipToGroupEnd") => Value::Void,
